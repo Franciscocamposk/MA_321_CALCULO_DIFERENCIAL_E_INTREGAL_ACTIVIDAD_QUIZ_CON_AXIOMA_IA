@@ -18,6 +18,22 @@ Axioma, que ofrece orientación durante la práctica.
 
 [Ver video de demostración](./evidencias/video-demostracion.mp4)
 
+## Así se ve el quiz
+
+| | |
+|---|---|
+| ![Portada del quiz](./evidencias/capturas/1-portada.png) | ![Modos y datos de ingreso](./evidencias/capturas/2-modos-y-datos.png) |
+| **1. Portada:** tema, número de preguntas y tiempo | **2. Ingreso:** quiz evaluado, práctica previa o práctica con Axioma IA |
+| ![Pregunta con Axioma IA](./evidencias/capturas/3-pregunta-y-axioma-ia.png) | ![Confianza y pista](./evidencias/capturas/4-confianza-y-pista.png) |
+| **3. Pregunta:** opciones con notación matemática y tutor Axioma IA | **4. Confianza y pista:** el estudiante indica su seguridad y recibe orientación |
+
+![Solución paso a paso y advertencia de integridad](./evidencias/capturas/5-solucion-y-advertencia.png)
+
+**5. Solución paso a paso** al verificar la respuesta y advertencia de integridad
+al salir de la pestaña.
+
+Las capturas usan datos de prueba (usuario de práctica, no estudiantes reales).
+
 ## Documento de planificación
 
 [FRANCISCO_CAMPOS_SEDE_SUR.pdf](./FRANCISCO_CAMPOS_SEDE_SUR.pdf): planificación
