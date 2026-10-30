@@ -1,0 +1,3666 @@
+<script>
+  /* =====================================================================
+   *  LÓGICA DEL CLIENTE — QUIZ DE CÁLCULO
+   *  El navegador NO conoce las respuestas correctas: solo muestra
+   *  preguntas, guarda respuestas temporalmente y llama al servidor.
+   *
+   *  Funciones del servidor usadas (Código.gs):
+   *    obtenerConfiguracionPublica(), iniciarQuiz(datos),
+   *    guardarProgreso(intentoId, respuestas, integridad), consultarTutorGuia(datos),
+   *    finalizarQuiz(datos), verificarRespuesta(datos), explicarMiError(datos), subirProcedimiento(datos),
+   *    eliminarProcedimiento(intentoId, nombre), obtenerPanelDocente(pin), exportarNotasPanel(pin)
+   * ===================================================================== */
+
+  // ---------- Estado global de la aplicación ----------
+  var estado = {
+    config: null,
+    intentoId: null,
+    nombre: '',
+    preguntas: [],
+    respuestas: {},        // { "1": "A", "2": {valor, justificacion}, "5": ["A","B"], ... }
+    pistas: [],            // pistas usadas por pregunta
+    chats: {},             // historial del tutor por pregunta
+    actual: 0,             // índice de la pregunta visible
+    fin: 0,                // marca de tiempo (ms) en que termina el quiz
+    intervalo: null,
+    temporizadorGuardado: null,
+    enviando: false,
+    finalizado: false,
+    pidiendoPista: false,
+    pistaDesde: 0,
+    pistaTimer: null,
+    reintentosEnvio: 0,
+    maxPistas: 3,
+    retroInmediata: false,
+    verificadas: {},       // { "3": item de retroalimentación } preguntas ya verificadas (respuesta fija)
+    verificando: false,    // número de la pregunta que se está verificando
+    integridad: { salidas: 0, segundosFuera: 0, advertencias: 0, copiados: 0, incidentes: [] },
+    ocultoDesde: 0,
+    ultimoIncidente: 0,    // evita contar dos veces el mismo incidente (ocultar + redimensionar)
+    ignorarHasta: 0,       // pausa del control mientras se elige un archivo del procedimiento
+    ventanaBase: null,     // tamaño de ventana de referencia para detectar reducciones
+    ventanaReducida: false,
+    cierreIntegridad: '',
+    confianza: {},         // { "3": "Seguro" } nivel de confianza indicado antes de verificar
+    practica: false,       // modo práctica: no cuenta para la nota y muestra soluciones
+    procedimiento: { habilitado: false, obligatorio: false, maxArchivos: 3, archivos: [] },
+    subiendo: false,
+    todasPreguntas: [],    // banco completo (6 + extras)
+    extrasDesbloqueadas: false  // el estudiante elige las extras al terminar las 6
+  };
+
+  var MAX_REINTENTOS_AUTOMATICOS = 3;
+  var MAX_REINTENTOS_BLOQUEO = 12;
+  var ESPERA_REINTENTO_ENVIO_MS = 10000;
+  var FALLOS_PARA_AVISO_CONEXION = 2;
+  var PREFIJO_RESPALDO = 'quizMA321_';
+
+  // ---------- Utilidades del DOM ----------
+  function $(id) { return document.getElementById(id); }
+
+  function crear(etiqueta, clase, texto) {
+    var el = document.createElement(etiqueta);
+    if (clase) el.className = clase;
+    if (texto !== undefined && texto !== null) el.textContent = texto;
+    return el;
+  }
+
+  function mostrarPantalla(id) {
+    detenerLectura();
+    var pantallas = document.querySelectorAll('.pantalla');
+    for (var i = 0; i < pantallas.length; i++) pantallas[i].classList.remove('activa');
+    $(id).classList.add('activa');
+    window.scrollTo(0, 0);
+  }
+
+  function mostrarCarga(texto) {
+    $('overlay-texto').textContent = texto || 'Procesando…';
+    $('overlay-carga').classList.remove('oculto');
+  }
+
+  function ocultarCarga() { $('overlay-carga').classList.add('oculto'); }
+
+  function mostrarToast(texto, ms) {
+    var t = $('toast');
+    t.textContent = texto;
+    t.classList.remove('oculto');
+    clearTimeout(mostrarToast._id);
+    mostrarToast._id = setTimeout(function () { t.classList.add('oculto'); }, ms || 3500);
+  }
+
+  /** Modal reutilizable. Si textoCancelar es null, se oculta el botón Cancelar. */
+  function abrirModal(titulo, texto, textoAceptar, alAceptar, textoCancelar, alCancelar) {
+    $('modal-titulo').textContent = titulo;
+    $('modal-texto').textContent = texto;
+    $('modal-texto').className = '';
+    $('modal-aceptar').textContent = textoAceptar || 'Aceptar';
+    var cancelar = $('modal-cancelar');
+    if (textoCancelar === null) {
+      cancelar.classList.add('oculto');
+    } else {
+      cancelar.classList.remove('oculto');
+      cancelar.textContent = textoCancelar || 'Cancelar';
+    }
+    cancelar.onclick = function () {
+      cerrarModal();
+      if (alCancelar) alCancelar();
+    };
+    $('modal-aceptar').onclick = function () {
+      cerrarModal();
+      if (alAceptar) alAceptar();
+    };
+    $('modal').classList.remove('oculto');
+    $('modal-aceptar').focus();
+  }
+
+  function cerrarModal() { $('modal').classList.add('oculto'); }
+
+  // ---------- Apariencia: modo oscuro, panel del tutor en celular, aviso de guardado ----------
+  var CLAVE_TEMA = 'quizMA321_tema';
+
+  // Íconos de línea (24×24) que toman el color del texto.
+  var ICONOS = {
+    luna: '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z"/>',
+    sol: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>',
+    check: '<path d="M20 6 9 17l-5-5"/>',
+    x: '<path d="M18 6 6 18M6 6l12 12"/>',
+    parcial: '<path d="M5 12h14"/>',
+    nube: '<path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9z"/><path d="m9 14 2 2 4-4"/>'
+  };
+
+  function icono(nombre) {
+    var span = document.createElement('span');
+    span.className = 'icono-contenedor';
+    span.innerHTML = '<svg class="icono" viewBox="0 0 24 24" aria-hidden="true">' + (ICONOS[nombre] || '') + '</svg>';
+    return span;
+  }
+
+  function aplicarTemaClaro() {
+    document.body.classList.remove('oscuro');
+    try { localStorage.removeItem(CLAVE_TEMA); } catch (e) { /* sin almacenamiento */ }
+  }
+
+  // ---------- Accesibilidad: tamaño de letra y alto contraste ----------
+  var CLAVE_LETRA = 'quizMA321_letra';
+  var CLAVE_CONTRASTE = 'quizMA321_contraste';
+  var NIVELES_LETRA = ['Tamaño de letra normal', 'Letra grande', 'Letra muy grande'];
+
+  function leerPreferencia(clave) {
+    try { return localStorage.getItem(clave); } catch (e) { return null; }
+  }
+
+  function guardarPreferencia(clave, valor) {
+    try { localStorage.setItem(clave, valor); } catch (e) { /* sin almacenamiento */ }
+  }
+
+  function aplicarLetra(nivel) {
+    nivel = Math.max(0, Math.min(NIVELES_LETRA.length - 1, Number(nivel) || 0));
+    var raiz = document.documentElement;
+    raiz.classList.remove('letra-1', 'letra-2');
+    if (nivel) raiz.classList.add('letra-' + nivel);
+    var siguiente = (nivel + 1) % NIVELES_LETRA.length;
+    var boton = $('btn-letra');
+    boton.title = 'Actual: ' + NIVELES_LETRA[nivel] + '. Clic para: ' + NIVELES_LETRA[siguiente].toLowerCase();
+    boton.setAttribute('aria-label', boton.title);
+    boton.classList.toggle('activo', nivel > 0);
+    return nivel;
+  }
+
+  function alternarLetra() {
+    var actual = document.documentElement.classList.contains('letra-2') ? 2
+      : document.documentElement.classList.contains('letra-1') ? 1 : 0;
+    var nivel = aplicarLetra((actual + 1) % NIVELES_LETRA.length);
+    guardarPreferencia(CLAVE_LETRA, String(nivel));
+    mostrarToast(NIVELES_LETRA[nivel], 1800);
+  }
+
+  function aplicarContraste(activo) {
+    document.body.classList.toggle('alto-contraste', activo);
+    var boton = $('btn-contraste');
+    boton.title = activo ? 'Desactivar alto contraste' : 'Activar alto contraste';
+    boton.setAttribute('aria-label', boton.title);
+    boton.setAttribute('aria-pressed', activo ? 'true' : 'false');
+    boton.classList.toggle('activo', activo);
+  }
+
+  function alternarContraste() {
+    var activo = !document.body.classList.contains('alto-contraste');
+    aplicarContraste(activo);
+    guardarPreferencia(CLAVE_CONTRASTE, activo ? '1' : '0');
+    mostrarToast(activo ? 'Alto contraste activado' : 'Alto contraste desactivado', 1800);
+  }
+
+  // ---------- Lectura en voz alta del enunciado ----------
+  var NUMEROS_ORDINALES_POTENCIA = { '2': 'al cuadrado', '3': 'al cubo' };
+
+  /** Convierte un fragmento LaTeX en texto que un lector de voz pronuncie en español. */
+  function matematicaParaVoz(tex) {
+    var t = ' ' + tex + ' ';
+    t = t.replace(/\\(displaystyle|left|right|big|Big|quad|qquad)(?![a-zA-Z])/g, ' ')
+      .replace(/\\[,;:! ]/g, ' ')
+      .replace(/\\[dt]frac/g, '\\frac')
+      .replace(/\\mathbb\{R\}/g, ' los números reales ')
+      .replace(/\\iff/g, ' si y solo si ')
+      .replace(/\\(ge|geq)(?![a-zA-Z])/g, ' mayor o igual que ')
+      .replace(/\\(le|leq)(?![a-zA-Z])/g, ' menor o igual que ')
+      .replace(/\\ne(?![a-zA-Z])/g, ' distinto de ')
+      .replace(/\\pm/g, ' más o menos ')
+      .replace(/\\cdot|\\times/g, ' por ')
+      .replace(/\\in(?![a-zA-Z])/g, ' en ')
+      .replace(/\\ln(?![a-zA-Z])/g, ' logaritmo natural de ')
+      .replace(/\\infty/g, ' infinito ');
+    var limite = '(\\{(?:[^{}]|\\{[^{}]*\\})*\\}|-?\\w)';
+    t = t.replace(new RegExp('\\\\int\\s*_\\s*' + limite + '\\s*\\^\\s*' + limite, 'g'), function (m, a, b) {
+      var quitar = function (s) { return s.charAt(0) === '{' ? s.slice(1, -1) : s; };
+      return ' la integral desde ' + matematicaParaVoz(quitar(a)) + ' hasta ' + matematicaParaVoz(quitar(b)) + ' de ';
+    });
+    var antes;
+    do {
+      antes = t;
+      t = t.replace(/\^\{([^{}]*)\}/g, function (m, e) { return ' ' + (NUMEROS_ORDINALES_POTENCIA[e.trim()] || 'elevado a ' + e) + ' '; })
+        .replace(/\^(\d)/g, function (m, e) { return ' ' + (NUMEROS_ORDINALES_POTENCIA[e] || 'elevado a ' + e) + ' '; })
+        .replace(/\(([^()]*)\)\s*(al cuadrado|al cubo|elevado a)/g, ' la cantidad $1, $2')
+        .replace(/\\frac\{([^{}]*)\}\{([^{}]*)\}/g, ' $1 sobre $2 ')
+        .replace(/\\sqrt\[3\]\{([^{}]*)\}/g, ' raíz cúbica de $1 ')
+        .replace(/\\sqrt\{([^{}]*)\}/g, ' raíz cuadrada de $1 ');
+      if (t === antes) t = t.replace(/(^|[^}\]a-zA-Z^])\{([^{}]*)\}/g, '$1 $2 ');
+    } while (t !== antes);
+    t = t.replace(/\\int/g, ' la integral de ')
+      .replace(/\^\s*(-?\w)/g, ' elevado a $1 ')
+      .replace(/\bd([xtu])\b/g, ', diferencial de $1 ')
+      .replace(/([A-Za-z])'\s*\(([^()]*)\)/g, ' $1 prima de $2 ')
+      .replace(/\b([fgFGH])\s*\(([^()]*)\)/g, ' $1 de $2 ')
+      .replace(/\[([^\[\],]+),([^\[\],]+)\]/g, ' el intervalo de $1 a $2 ')
+      .replace(/\|([^|]+)\|/g, ' valor absoluto de $1 ')
+      .replace(/\\[a-zA-Z]+/g, ' ')
+      .replace(/(\d)\s*([a-z])/g, '$1 $2')
+      .replace(/\s-\s?|^-/g, ' menos ')
+      .replace(/-/g, ' menos ')
+      .replace(/\+/g, ' más ')
+      .replace(/=/g, ' igual a ')
+      .replace(/</g, ' menor que ')
+      .replace(/>/g, ' mayor que ')
+      .replace(/[_(){}]/g, ' ');
+    return t.replace(/\s+/g, ' ').replace(/\s+,/g, ',').trim();
+  }
+
+  /** Enunciado completo (texto y fórmulas) listo para leerse en voz alta. */
+  function textoParaVoz(enunciado) {
+    var partes = String(enunciado || '').split('$');
+    return partes.map(function (p, i) {
+      if (i % 2) return ' ' + matematicaParaVoz(p) + ' ';
+      return p.replace(/[«»]/g, '"');
+    }).join('').replace(/\s+/g, ' ').replace(/\s+([.,;:?])/g, '$1').trim();
+  }
+
+  function lecturaDisponible() {
+    return typeof window.speechSynthesis !== 'undefined' && typeof window.SpeechSynthesisUtterance !== 'undefined';
+  }
+
+  function vozEspanol() {
+    var voces = window.speechSynthesis.getVoices() || [];
+    var preferidas = ['es-CR', 'es-MX', 'es-US', 'es-419', 'es-ES'];
+    for (var i = 0; i < preferidas.length; i++) {
+      for (var j = 0; j < voces.length; j++) {
+        if ((voces[j].lang || '').replace('_', '-').toLowerCase() === preferidas[i].toLowerCase()) return voces[j];
+      }
+    }
+    for (var k = 0; k < voces.length; k++) {
+      if (/^es/i.test(voces[k].lang || '')) return voces[k];
+    }
+    return null;
+  }
+
+  function marcarLectura(activa) {
+    var boton = $('btn-leer');
+    if (!boton) return;
+    boton.classList.toggle('leyendo', activa);
+    boton.setAttribute('aria-pressed', activa ? 'true' : 'false');
+    boton.querySelector('.btn-leer-texto').textContent = activa ? 'Detener' : 'Escuchar';
+    boton.title = activa ? 'Detener la lectura' : 'Escuchar el enunciado';
+  }
+
+  function detenerLectura() {
+    if (lecturaDisponible()) window.speechSynthesis.cancel();
+    marcarLectura(false);
+  }
+
+  function alternarLectura() {
+    if (!lecturaDisponible()) return;
+    if ($('btn-leer').classList.contains('leyendo')) { detenerLectura(); return; }
+    var p = estado.preguntas && estado.preguntas[estado.actual];
+    if (!p) return;
+    window.speechSynthesis.cancel();
+    var u = new SpeechSynthesisUtterance(textoParaVoz(p.enunciado));
+    var voz = vozEspanol();
+    if (voz) u.voice = voz;
+    u.lang = voz ? voz.lang : 'es-ES';
+    u.rate = 0.92;
+    u.onend = u.onerror = function () { marcarLectura(false); };
+    marcarLectura(true);
+    window.speechSynthesis.speak(u);
+  }
+
+  function abrirTutorMovil(abrir) {
+    document.body.classList.toggle('tutor-abierto', abrir);
+    if (abrir) setTimeout(function () { $('tutor-chat').scrollTop = $('tutor-chat').scrollHeight; }, 50);
+  }
+
+  function mostrarEstadoGuardado(estadoGuardado) {
+    var el = $('indicador-guardado');
+    var textos = { guardando: 'Guardando…', guardado: 'Guardado', error: 'Sin conexión: guardado en este equipo' };
+    el.textContent = '';
+    if (estadoGuardado === 'guardado') el.appendChild(icono('nube'));
+    el.appendChild(document.createTextNode(textos[estadoGuardado] || ''));
+    el.className = 'indicador-guardado ' + (estadoGuardado || '');
+    clearTimeout(mostrarEstadoGuardado._id);
+    if (estadoGuardado === 'guardado') {
+      mostrarEstadoGuardado._id = setTimeout(function () { el.classList.add('desvanecer'); }, 2500);
+    }
+  }
+
+  /** En respuestas cortas, las fracciones se ven a tamaño completo para que sean legibles. */
+  function fraccionesGrandes(texto) {
+    return String(texto === null || texto === undefined ? '' : texto).replace(/\\frac(?=\s*\{)/g, '\\dfrac');
+  }
+
+  /** Convierte potencias fraccionarias de x y t a radicales antes de usar KaTeX. */
+  function potenciasARadicales(texto) {
+    var t = String(texto === null || texto === undefined ? '' : texto);
+    var convertirDecimal = function (m, base, exponente) {
+      var valor = Number(exponente);
+      if (!isFinite(valor) || Math.floor(valor) === valor) return m;
+      var partes = String(Math.round(valor * 1000000) / 1000000).split('.');
+      var den = Math.pow(10, partes[1].length);
+      var num = Math.round(valor * den);
+      var divisor = function (a, b) { while (b) { var r = a % b; a = b; b = r; } return Math.abs(a) || 1; };
+      var d = divisor(Math.abs(num), den);
+      num /= d;
+      den /= d;
+      return potenciaFraccionARadical(base, num, den);
+    };
+    var convertirFraccion = function (m, base, signo, numerador, denominador) {
+      return potenciaFraccionARadical(base, Number(signo === '-' ? -numerador : numerador), Number(denominador));
+    };
+    t = t.replace(/([xt])\^\{(-?)(\d+)\/(\d+)\}/g, convertirFraccion);
+    t = t.replace(/([xt])\^\{(-?\d+\.\d+)\}/g, convertirDecimal);
+    return t;
+  }
+
+  function potenciaFraccionARadical(base, numerador, denominador) {
+    if (!denominador || denominador === 1 || numerador === 0) return base + '^{' + numerador + '}';
+    var signo = numerador < 0 ? -1 : 1;
+    var n = Math.abs(numerador);
+    var radicando = n === 1 ? base : base + '^{' + n + '}';
+    var raiz = denominador === 2 ? '\\sqrt{' + radicando + '}' : '\\sqrt[' + denominador + ']{' + radicando + '}';
+    return signo < 0 ? '\\dfrac{1}{' + raiz + '}' : raiz;
+  }
+
+  function horaActual() {
+    var d = new Date();
+    return (d.getHours() < 10 ? '0' : '') + d.getHours() + ':' + (d.getMinutes() < 10 ? '0' : '') + d.getMinutes();
+  }
+
+  // ---------- Notación matemática ----------
+
+  /**
+   * Escribe en el elemento un texto que puede contener LaTeX entre $...$ o $$...$$.
+   * Usa KaTeX si está disponible; si no, muestra una versión en texto plano.
+   * El texto normal se inserta como nodo de texto (sin riesgo de inyectar HTML).
+   */
+  function escribirMat(el, texto) {
+    el.innerHTML = '';
+    var partes = String(texto === null || texto === undefined ? '' : texto)
+      .split(/(\$\$[\s\S]+?\$\$|\$[^$]+?\$)/g);
+    partes.forEach(function (parte) {
+      if (!parte) return;
+      var enBloque = parte.length > 4 && parte.indexOf('$$') === 0 && parte.lastIndexOf('$$') === parte.length - 2;
+      var enLinea = !enBloque && parte.length > 2 && parte.charAt(0) === '$' && parte.charAt(parte.length - 1) === '$';
+      if (!enBloque && !enLinea) {
+        el.appendChild(document.createTextNode(parte));
+        return;
+      }
+      var tex = enBloque ? parte.slice(2, -2) : parte.slice(1, -1);
+      tex = potenciasARadicales(fraccionesGrandes(tex));
+      var contenedor = document.createElement(enBloque ? 'div' : 'span');
+      if (window.katex) {
+        try {
+          katex.render(tex, contenedor, {
+            throwOnError: false,
+            displayMode: enBloque,
+            macros: {
+              '\\sec': '\\operatorname{sec}',
+              '\\csc': '\\operatorname{csc}',
+              '\\cot': '\\operatorname{cot}'
+            }
+          });
+        } catch (e) {
+          contenedor.textContent = latexAPlano(tex);
+        }
+      } else {
+        contenedor.textContent = latexAPlano(tex);
+      }
+      el.appendChild(contenedor);
+    });
+  }
+
+  /** Conversión básica de LaTeX a texto (respaldo si KaTeX no carga). */
+  function latexAPlano(t) {
+    t = t.replace(/\^\{([^{}]*)\}/g, '^($1)').replace(/_\{([^{}]*)\}/g, '_($1)');
+    for (var i = 0; i < 3; i++) t = t.replace(/\\[dt]?frac\{([^{}]*)\}\{([^{}]*)\}/g, '($1)/($2)');
+    var mapa = { 'int': '∫', 'cdot': '·', 'pi': 'π', 'infty': '∞', 'in': '∈', 'neq': '≠', 'le': '≤', 'ge': '≥',
+      'ln': 'ln', 'left': '', 'right': '', 'displaystyle': '', ',': ' ', ';': ' ', '!': '' };
+    return t.replace(/\\([a-zA-Z]+|[,;!])/g, function (m, c) { return mapa.hasOwnProperty(c) ? mapa[c] : c; })
+      .replace(/\^\{([^{}]*)\}/g, '^$1').replace(/_\{([^{}]*)\}/g, '_$1').replace(/[{}]/g, '');
+  }
+
+  /**
+   * Convierte lo que escribe el estudiante (ej. 2x^3/3 - 1/(2x^2)) en LaTeX.
+   * Usa la misma precedencia que el evaluador del servidor: ^ antes que * y /,
+   * multiplicación implícita igual que *, y todo de izquierda a derecha.
+   * Devuelve { ok, tex }; ok=false si la expresión está incompleta.
+   */
+  function expresionATex(texto) {
+    var s = String(texto || '').replace(/[$\\{}]/g, '')
+      .replace(/²/g, '^2').replace(/³/g, '^3').replace(/⁴/g, '^4')
+      .replace(/[−–]/g, '-').replace(/[·×]/g, '*').replace(/÷/g, '/').trim();
+    var prefijo = '';
+    var m = s.match(/^([A-Za-z])\s*\(\s*x\s*\)\s*=\s*/);
+    if (m) {
+      prefijo = m[1] + '(x) = ';
+      s = s.slice(m[0].length);
+    }
+    if (!s) return { ok: !!prefijo, tex: prefijo };
+    s = s.replace(/√/g, 'sqrt').replace(/π/g, 'pi')
+      .replace(/(sqrt|sin|sen|cos|tan|sec|csc|cot|ln|exp|pi)/gi, ' $1 ');
+    var tokens = s.match(/\d+(?:[.,]\d+)?|[A-Za-z]+|\S/g) || [];
+    var FUNCIONES_TEX = {
+      sin: '\\sin', sen: '\\sin', cos: '\\cos', tan: '\\tan', sec: '\\sec',
+      csc: '\\csc', cot: '\\cot', ln: '\\ln', exp: '\\exp', sqrt: '\\sqrt'
+    };
+    var pos = 0;
+    var enExponente = 0;
+    var ver = function () { return tokens[pos]; };
+    var tomar = function () { return tokens[pos++]; };
+    var iniciaFactor = function (t) { return t !== undefined && (/^[\dA-Za-z]/.test(t) || t === '('); };
+    var interno = function (n) { return n.interno !== undefined ? n.interno : n.tex; };
+
+    function primario() {
+      var t = tomar();
+      if (t === undefined) throw new Error('incompleta');
+      if (/^\d/.test(t)) return { tex: t.replace(',', '{,}').replace('.', '{.}') };
+      var nombre = FUNCIONES_TEX[t.toLowerCase()];
+      if (nombre) {
+        var arg = ver() === '(' ? primario() : potencia();
+        return { tex: nombre === '\\sqrt' ? '\\sqrt{' + interno(arg) + '}' : nombre + ' ' + arg.tex };
+      }
+      if (t.toLowerCase() === 'pi') return { tex: '\\pi' };
+      if (/^[A-Za-z]/.test(t)) return { tex: t.length === 1 ? t : '\\mathrm{' + t + '}' };
+      if (t === '(') {
+        var e = expresion();
+        if (tomar() !== ')') throw new Error('incompleta');
+        return { tex: '\\left(' + e.tex + '\\right)', interno: e.tex };
+      }
+      throw new Error('símbolo');
+    }
+    function potencia() {
+      var base = primario();
+      if (ver() !== '^') return base;
+      tomar();
+      enExponente++;
+      var exponente = interno(unario());
+      enExponente--;
+      return { tex: base.tex + '^{' + exponente + '}' };
+    }
+    function unario() {
+      if (ver() === '-') { tomar(); return { tex: '-' + unario().tex }; }
+      if (ver() === '+') { tomar(); return unario(); }
+      return potencia();
+    }
+    function termino() {
+      var izq = unario();
+      for (;;) {
+        var t = ver();
+        if (t === '*') {
+          tomar();
+          izq = { tex: izq.tex + ' \\cdot ' + unario().tex };
+        } else if (t === '/') {
+          tomar();
+          var den = unario();
+          izq = { tex: enExponente ? izq.tex + '/' + den.tex : '\\dfrac{' + interno(izq) + '}{' + interno(den) + '}' };
+        } else if (iniciaFactor(t)) {
+          var der = potencia();
+          izq = { tex: izq.tex + (/\d\}?$/.test(izq.tex) && /^\d/.test(der.tex) ? ' \\cdot ' : ' ') + der.tex };
+        } else {
+          return izq;
+        }
+      }
+    }
+    function expresion() {
+      var izq = termino();
+      while (ver() === '+' || ver() === '-') {
+        var op = tomar();
+        izq = { tex: izq.tex + ' ' + op + ' ' + termino().tex };
+      }
+      return izq;
+    }
+    try {
+      var r = expresion();
+      if (pos < tokens.length) throw new Error('sobrante');
+      return { ok: true, tex: prefijo + r.tex };
+    } catch (e) {
+      return { ok: false, tex: '' };
+    }
+  }
+
+  /** Texto con notación matemática de lo que escribió el estudiante (o el texto tal cual si está incompleto). */
+  function aLatexEstudiante(texto) {
+    var limpio = String(texto || '').replace(/\$/g, '').trim();
+    if (!limpio) return '';
+    var r = expresionATex(limpio);
+    return r.ok && r.tex ? '$' + r.tex + '$' : limpio;
+  }
+
+  /** Inserta texto en la posición del cursor; "retroceso" deja el cursor dentro de los paréntesis. */
+  function insertarEnCampo(input, texto, retroceso) {
+    if (input.disabled) return;
+    var inicio = input.selectionStart === null ? input.value.length : input.selectionStart;
+    var fin = input.selectionEnd === null ? input.value.length : input.selectionEnd;
+    var nuevo = input.value.slice(0, inicio) + texto + input.value.slice(fin);
+    if (nuevo.length > input.maxLength && input.maxLength > 0) return;
+    input.value = nuevo;
+    var cursor = inicio + texto.length - (retroceso || 0);
+    input.focus();
+    try { input.setSelectionRange(cursor, cursor); } catch (e) { /* sin acción */ }
+    var evento;
+    try { evento = new Event('input', { bubbles: true }); } catch (e) {
+      evento = document.createEvent('Event');
+      evento.initEvent('input', true, true);
+    }
+    input.dispatchEvent(evento);
+  }
+
+  // ---------- Gráficas (SVG, sin librerías) ----------
+
+  var COLORES_CURVAS = ['#00467f', '#d9480f', '#2b8a3e'];
+
+  /** Evalúa un polinomio con coeficientes del mayor grado al menor. */
+  function evaluarPolinomio(coefs, x) {
+    return coefs.reduce(function (acum, c) { return acum * x + c; }, 0);
+  }
+
+  /** Curva polinómica ({coefs}) o combinación de sin x, cos x, e^x, 1/x y constantes ({terminos: [{f, c}]}). */
+  function evaluarCurva(curva, x) {
+    if (curva.coefs) return evaluarPolinomio(curva.coefs, x);
+    if (curva.puntos) {
+      // Curva muestreada en el servidor (áreas creadas por Axioma IA): interpolación lineal.
+      var m = curva.puntos, n = m.ys.length - 1;
+      var t = (x - m.x0) / (m.x1 - m.x0) * n;
+      if (t < 0 || t > n) return NaN;
+      var k = Math.min(n - 1, Math.floor(t));
+      var y0 = m.ys[k], y1 = m.ys[k + 1];
+      if (y0 === null || y1 === null) return NaN;
+      return y0 + (y1 - y0) * (t - k);
+    }
+    return (curva.terminos || []).reduce(function (suma, t) {
+      var v = t.f === 'sin' ? Math.sin(x)
+        : t.f === 'cos' ? Math.cos(x)
+        : t.f === 'exp' ? Math.exp(x)
+        : t.f === 'sqrt' ? (x < 0 ? NaN : Math.sqrt(x))
+        : t.f === 'inv' ? (Math.abs(x) < 1e-9 ? NaN : 1 / x)
+        : 1;
+      return suma + (t.c || 0) * v;
+    }, 0);
+  }
+
+  /** Paso "redondo" (1, 2 o 5 × 10^k) para las marcas de los ejes. */
+  function pasoRedondo(rango) {
+    var bruto = rango / 8;
+    var potencia = Math.pow(10, Math.floor(Math.log(bruto) / Math.LN10));
+    var r = bruto / potencia;
+    return (r < 1.5 ? 1 : r < 3.5 ? 2 : r < 7.5 ? 5 : 10) * potencia;
+  }
+
+  /**
+   * Dibuja curvas y región sombreada a partir de la especificación del servidor:
+   * { xmin, xmax, ymin, ymax, curvas: [{coefs, etiqueta}], region: {superior, inferior, a, b} }
+   * (índice -1 en la región = eje x).
+   */
+  function dibujarGrafica(contenedor, g) {
+    contenedor.innerHTML = '';
+    if (!g) { contenedor.classList.add('oculto'); return; }
+    contenedor.classList.remove('oculto');
+
+    var W = 440, H = 300, M = 32;
+    var NS = 'http://www.w3.org/2000/svg';
+    var sx = function (x) { return M + (x - g.xmin) / (g.xmax - g.xmin) * (W - 2 * M); };
+    var sy = function (y) { return H - M - (y - g.ymin) / (g.ymax - g.ymin) * (H - 2 * M); };
+    var nodo = function (etiqueta, atributos, padre, texto) {
+      var el = document.createElementNS(NS, etiqueta);
+      for (var k in atributos) el.setAttribute(k, atributos[k]);
+      if (texto !== undefined) el.textContent = texto;
+      padre.appendChild(el);
+      return el;
+    };
+
+    var svg = nodo('svg', { viewBox: '0 0 ' + W + ' ' + H, 'class': 'grafica-svg', role: 'img' }, contenedor);
+    var idRecorte = 'recorte-' + Math.random().toString(36).slice(2);
+    var recorte = nodo('clipPath', { id: idRecorte }, nodo('defs', {}, svg));
+    nodo('rect', { x: M, y: M, width: W - 2 * M, height: H - 2 * M }, recorte);
+
+    // Rejilla y marcas
+    var ejeX = Math.min(Math.max(sy(0), M), H - M);
+    var ejeY = Math.min(Math.max(sx(0), M), W - M);
+    if (g.marcasX) {
+      g.marcasX.forEach(function (marca) {
+        nodo('line', { x1: sx(marca.x), y1: M, x2: sx(marca.x), y2: H - M, 'class': 'g-rejilla' }, svg);
+        nodo('text', { x: sx(marca.x), y: ejeX + 14, 'class': 'g-texto', 'text-anchor': 'middle' }, svg, marca.texto);
+      });
+    } else {
+      var px = pasoRedondo(g.xmax - g.xmin) < 1 ? 0.5 : 1;
+      for (var x = Math.ceil(g.xmin / px) * px; x <= g.xmax + 1e-9; x += px) {
+        nodo('line', { x1: sx(x), y1: M, x2: sx(x), y2: H - M, 'class': 'g-rejilla' }, svg);
+        if (Math.abs(x) > 1e-9 && Math.abs(x - Math.round(x)) < 1e-9) {
+          nodo('text', { x: sx(x), y: ejeX + 14, 'class': 'g-texto', 'text-anchor': 'middle' }, svg, String(Math.round(x)));
+        }
+      }
+    }
+    var py = pasoRedondo(g.ymax - g.ymin);
+    for (var y = Math.ceil(g.ymin / py) * py; y <= g.ymax + 1e-9; y += py) {
+      nodo('line', { x1: M, y1: sy(y), x2: W - M, y2: sy(y), 'class': 'g-rejilla' }, svg);
+      if (Math.abs(y) > 1e-9) {
+        nodo('text', { x: ejeY - 5, y: sy(y) + 4, 'class': 'g-texto', 'text-anchor': 'end' }, svg, String(Math.round(y * 100) / 100));
+      }
+    }
+
+    // Región sombreada
+    if (g.region) {
+      var r = g.region;
+      var curvaA = r.superior >= 0 ? g.curvas[r.superior] : { coefs: [0] };
+      var curvaB = r.inferior >= 0 ? g.curvas[r.inferior] : { coefs: [0] };
+      // Con "entre", las curvas pueden cruzarse: se sombrea entre la mayor y la menor.
+      var arriba = function (t) {
+        var p = evaluarCurva(curvaA, t), q = evaluarCurva(curvaB, t);
+        return r.entre ? Math.max(p, q) : p;
+      };
+      var abajo = function (t) {
+        var p = evaluarCurva(curvaA, t), q = evaluarCurva(curvaB, t);
+        return r.entre ? Math.min(p, q) : q;
+      };
+      var puntos = [];
+      var N = 80, i, xi;
+      for (i = 0; i <= N; i++) {
+        xi = r.a + (r.b - r.a) * i / N;
+        puntos.push(sx(xi).toFixed(1) + ',' + sy(arriba(xi)).toFixed(1));
+      }
+      for (i = N; i >= 0; i--) {
+        xi = r.a + (r.b - r.a) * i / N;
+        puntos.push(sx(xi).toFixed(1) + ',' + sy(abajo(xi)).toFixed(1));
+      }
+      nodo('polygon', { points: puntos.join(' '), 'class': 'g-region', 'clip-path': 'url(#' + idRecorte + ')' }, svg);
+    }
+
+    // Ejes
+    nodo('line', { x1: M, y1: ejeX, x2: W - M + 8, y2: ejeX, 'class': 'g-eje' }, svg);
+    nodo('line', { x1: ejeY, y1: H - M, x2: ejeY, y2: M - 8, 'class': 'g-eje' }, svg);
+    nodo('text', { x: W - M + 12, y: ejeX + 4, 'class': 'g-etiqueta-eje' }, svg, 'x');
+    nodo('text', { x: ejeY + 6, y: M - 10, 'class': 'g-etiqueta-eje' }, svg, 'y');
+
+    // Curvas
+    g.curvas.forEach(function (c, k) {
+      var pts = [];
+      for (var j = 0; j <= 240; j++) {
+        var xc = g.xmin + (g.xmax - g.xmin) * j / 240;
+        var yc = evaluarCurva(c, xc);
+        if (!isFinite(yc)) continue;
+        pts.push(sx(xc).toFixed(1) + ',' + sy(yc).toFixed(1));
+      }
+      if (!pts.length) return;
+      nodo('polyline', {
+        points: pts.join(' '), 'class': 'g-curva',
+        stroke: COLORES_CURVAS[k % COLORES_CURVAS.length], 'clip-path': 'url(#' + idRecorte + ')'
+      }, svg);
+    });
+
+    // Leyenda con notación matemática
+    var leyenda = crear('div', 'grafica-leyenda');
+    g.curvas.forEach(function (c, k) {
+      var item = crear('span', 'leyenda-item');
+      var color = crear('span', 'leyenda-color');
+      color.style.background = COLORES_CURVAS[k % COLORES_CURVAS.length];
+      item.appendChild(color);
+      var etiqueta = crear('span');
+      escribirMat(etiqueta, c.etiqueta);
+      item.appendChild(etiqueta);
+      leyenda.appendChild(item);
+    });
+    if (g.region) {
+      var itemRegion = crear('span', 'leyenda-item');
+      itemRegion.appendChild(crear('span', 'leyenda-region'));
+      itemRegion.appendChild(crear('span', null, 'Región'));
+      leyenda.appendChild(itemRegion);
+    }
+    contenedor.appendChild(leyenda);
+  }
+
+  // ---------- Respaldo local de respuestas ----------
+
+  function guardarRespaldoLocal() {
+    try {
+      localStorage.setItem(PREFIJO_RESPALDO + estado.intentoId, JSON.stringify(estado.respuestas));
+    } catch (e) { /* almacenamiento no disponible */ }
+  }
+
+  function leerRespaldoLocal(intentoId) {
+    try {
+      var v = localStorage.getItem(PREFIJO_RESPALDO + intentoId);
+      return v ? JSON.parse(v) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function borrarRespaldoLocal(intentoId) {
+    try { localStorage.removeItem(PREFIJO_RESPALDO + intentoId); } catch (e) { /* sin acción */ }
+  }
+
+  // ---------- Un solo dispositivo por intento ----------
+  var CLAVE_DISPOSITIVO = 'quizMA321_dispositivo';
+
+  /** Identificador aleatorio de este navegador; se conserva entre recargas. Vacío si no hay almacenamiento. */
+  function idDispositivo() {
+    if (estado.dispositivo !== undefined) return estado.dispositivo;
+    var id = '';
+    try {
+      id = localStorage.getItem(CLAVE_DISPOSITIVO) || '';
+      if (!/^[A-Za-z0-9\-]{8,64}$/.test(id)) {
+        var bytes = new Uint8Array(16);
+        (window.crypto || window.msCrypto).getRandomValues(bytes);
+        id = Array.prototype.map.call(bytes, function (b) { return (b < 16 ? '0' : '') + b.toString(16); }).join('');
+        localStorage.setItem(CLAVE_DISPOSITIVO, id);
+      }
+    } catch (e) {
+      id = '';
+    }
+    estado.dispositivo = id;
+    return id;
+  }
+
+  /** El intento se abrió en otro dispositivo (liberado por el docente): este deja de funcionar. */
+  function bloquearPorOtroDispositivo() {
+    if (estado.bloqueadoDispositivo) return;
+    estado.bloqueadoDispositivo = true;
+    estado.finalizado = true;
+    clearInterval(estado.intervalo);
+    clearInterval(estado.latido);
+    clearTimeout(estado.temporizadorGuardado);
+    ocultarCarga();
+    deshabilitarControles(true);
+    abrirModal('El intento continúa en otro dispositivo',
+      'Tu docente permitió continuar este intento en otro celular o computadora, así que este dispositivo ya no puede modificarlo ni enviarlo.\n\n' +
+      'Tus respuestas guardadas siguen disponibles en el nuevo dispositivo.', 'Entendido', null, null);
+  }
+
+  // ---------- Integridad: salidas de la pestaña ----------
+
+  function conexionRecuperada() {
+    var visible = !$('indicador-conexion').classList.contains('oculto');
+    $('indicador-conexion').classList.add('oculto');
+    if (visible && quizEnCurso()) mostrarToast('Conexión recuperada. Tus respuestas se guardan de nuevo en línea.', 3500);
+  }
+
+  function quizEnCurso() {
+    return !!estado.intentoId && !estado.finalizado && !estado.enviando;
+  }
+
+  function cerrarPeriodoFuera() {
+    if (estado.ocultoDesde) {
+      estado.integridad.segundosFuera += Math.round((Date.now() - estado.ocultoDesde) / 1000);
+      estado.ocultoDesde = 0;
+    }
+  }
+
+  function alCambiarVisibilidad() {
+    if (!quizEnCurso()) return;
+    if (document.hidden) {
+      estado.integridad.salidas++;
+      estado.ocultoDesde = Date.now();
+      registrarIncidente('Salió de la pestaña o minimizó la ventana');
+    } else {
+      cerrarPeriodoFuera();
+      setTimeout(function () { evaluarVentana(true); }, 700);
+      programarGuardado();
+    }
+  }
+
+  /**
+   * Cambiar a otra aplicación (Word, otra ventana, Alt+Tab) no oculta la pestaña: solo le quita el foco.
+   * Se espera un momento y se confirma con document.hasFocus() para no contar parpadeos.
+   */
+  function alPerderFoco() {
+    if (!quizEnCurso() || document.hidden) return;
+    clearTimeout(alPerderFoco._id);
+    alPerderFoco._id = setTimeout(function () {
+      if (!quizEnCurso() || document.hidden || document.hasFocus() || Date.now() < estado.ignorarHasta) return;
+      estado.fueraDeFoco = true;
+      estado.integridad.salidas++;
+      if (!estado.ocultoDesde) estado.ocultoDesde = Date.now();
+      registrarIncidente('Cambió a otra aplicación o ventana (por ejemplo, Word o el explorador)');
+      programarGuardado();
+    }, 800);
+  }
+
+  function alRecuperarFoco() {
+    clearTimeout(alPerderFoco._id);
+    if (!estado.fueraDeFoco) return;
+    estado.fueraDeFoco = false;
+    if (!quizEnCurso()) return;
+    cerrarPeriodoFuera();
+    programarGuardado();
+  }
+
+  /** El control estricto (advertencia y cierre) aplica al quiz y a la práctica IA. */
+  function controlVentanaActivo() {
+    return !!(estado.config && estado.config.controlVentana) && quizEnCurso();
+  }
+
+  function esDispositivoTactil() {
+    return !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+  }
+
+  function medirVentana() {
+    return {
+      ancho: window.outerWidth || window.innerWidth,
+      alto: window.outerHeight || window.innerHeight,
+      escala: window.devicePixelRatio || 1
+    };
+  }
+
+  /** Detecta cuando el estudiante achica la ventana (ej. para ver otra ventana al lado). */
+  function alRedimensionar() {
+    clearTimeout(alRedimensionar._id);
+    alRedimensionar._id = setTimeout(function () { evaluarVentana(true); }, 600);
+  }
+
+  /**
+   * Compara el tamaño actual con el de referencia. Al pasar de normal a reducida registra
+   * un incidente; mientras siga reducida, el quiz queda tapado por la pantalla de bloqueo.
+   */
+  function evaluarVentana(contarIncidente) {
+    if (!controlVentanaActivo() || esDispositivoTactil()) {
+      actualizarBloqueoVentana();
+      return;
+    }
+    var v = medirVentana();
+    var base = estado.ventanaBase;
+    if (!base || v.escala !== base.escala) {
+      // Primera medición o cambio de zoom: se toma como nueva referencia.
+      estado.ventanaBase = v;
+      estado.ventanaReducida = false;
+      actualizarBloqueoVentana();
+      return;
+    }
+    if (v.ancho > base.ancho) base.ancho = v.ancho;
+    if (v.alto > base.alto) base.alto = v.alto;
+    var reducida = v.ancho < base.ancho * 0.8 || v.alto < base.alto * 0.75;
+    var nuevaReduccion = reducida && !estado.ventanaReducida;
+    estado.ventanaReducida = reducida;
+    actualizarBloqueoVentana();
+    if (nuevaReduccion && contarIncidente) registrarIncidente('Redujo el tamaño de la ventana');
+  }
+
+  function enPantallaCompleta() {
+    return !!(document.fullscreenElement || document.webkitFullscreenElement);
+  }
+
+  /** Pantalla completa exigida: solo si está activada y el navegador sí permitió activarla al iniciar. */
+  function exigePantallaCompleta() {
+    return !!(estado.config && estado.config.pantallaCompleta) && !!estado.pantallaCompletaLograda;
+  }
+
+  /**
+   * Tapa el quiz mientras la ventana siga reducida o fuera de la pantalla completa exigida;
+   * se quita sola al volver a la normalidad.
+   */
+  function actualizarBloqueoVentana() {
+    var activo = controlVentanaActivo() && !esDispositivoTactil();
+    var faltaPantalla = activo && exigePantallaCompleta() && !enPantallaCompleta();
+    var bloquear = activo && (!!estado.ventanaReducida || faltaPantalla);
+    if (bloquear) {
+      $('bloqueo-titulo').textContent = faltaPantalla ? 'La actividad debe estar en pantalla completa' : 'La ventana está reducida';
+      $('bloqueo-texto').textContent = faltaPantalla
+        ? 'Saliste de la pantalla completa. Para continuar, presiona el botón de abajo. La actividad está bloqueada y el tiempo sigue corriendo.'
+        : 'Para continuar, la ventana debe volver a su tamaño completo. La actividad está bloqueada y el tiempo sigue corriendo.';
+    }
+    $('bloqueo-ventana').classList.toggle('oculto', !bloquear);
+  }
+
+  function salirPantallaCompleta() {
+    try {
+      if (document.exitFullscreen && document.fullscreenElement) document.exitFullscreen().then(null, function () {});
+      else if (document.webkitExitFullscreen && document.webkitFullscreenElement) document.webkitExitFullscreen();
+    } catch (e) { /* sin acción */ }
+  }
+
+  /** Pide pantalla completa (solo funciona dentro de un clic del estudiante). */
+  function intentarPantallaCompleta() {
+    var el = document.documentElement;
+    var pedir = el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen;
+    if (!pedir || document.fullscreenElement || document.webkitFullscreenElement) return;
+    try {
+      var promesa = pedir.call(el);
+      if (promesa && promesa.then) promesa.then(null, function () { /* el navegador no lo permitió */ });
+    } catch (e) { /* sin acción */ }
+  }
+
+  function alCambiarPantallaCompleta() {
+    if (enPantallaCompleta()) {
+      estado.pantallaCompletaLograda = true;
+    } else if (controlVentanaActivo() && exigePantallaCompleta() && !esDispositivoTactil()) {
+      // Salir de la pantalla completa exigida es un incidente (advertencia o cierre).
+      registrarIncidente('Salió de la pantalla completa');
+    }
+    // El cambio de tamaño que provoca la pantalla completa no cuenta como incidente aparte.
+    estado.ignorarHasta = Math.max(estado.ignorarHasta, Date.now() + 2000);
+    setTimeout(function () { evaluarVentana(false); }, 700);
+  }
+
+  /**
+   * Primer incidente: advertencia. Al superar el máximo de advertencias, el quiz se cierra
+   * y se envía con las respuestas que tenga en ese momento.
+   */
+  function registrarIncidente(motivo) {
+    if (!controlVentanaActivo()) return;
+    var ahora = Date.now();
+    if (ahora < estado.ignorarHasta || ahora - estado.ultimoIncidente < 2000) return;
+    estado.ultimoIncidente = ahora;
+    var integ = estado.integridad;
+    integ.advertencias = (integ.advertencias || 0) + 1;
+    integ.incidentes = (integ.incidentes || []).concat([motivo]).slice(-10);
+    var maximo = Math.max(0, Number(estado.config.maxAdvertencias) || 0);
+
+    if (integ.advertencias > maximo) {
+      cerrarPorIntegridad(motivo);
+      return;
+    }
+    guardarAhora();
+    var restantes = maximo - integ.advertencias;
+    abrirModal('Advertencia ' + integ.advertencias + ' de ' + maximo,
+      motivo + '.\n\nDurante el quiz NO puedes salir de esta pestaña, cambiar de ventana ni reducir el tamaño de la ventana. ' +
+      (restantes > 0
+        ? 'Te quedan ' + restantes + ' advertencia(s).'
+        : 'Si vuelve a ocurrir, el quiz se cerrará automáticamente y se enviará con las respuestas que tengas en ese momento.') +
+      '\n\nEste incidente quedó registrado para tu docente.' +
+      (estado.ventanaReducida ? '\n\nAl aceptar, la ventana debe volver a su tamaño completo para continuar.'
+        : (exigePantallaCompleta() && !enPantallaCompleta() ? '\n\nAl aceptar, el quiz volverá a pantalla completa.' : '')),
+      'Entendido, volver al quiz', function () {
+        if (estado.ventanaReducida || exigePantallaCompleta()) intentarPantallaCompleta();
+        setTimeout(function () { evaluarVentana(false); }, 700);
+      }, null);
+  }
+
+  function cerrarPorIntegridad(motivo) {
+    if (estado.enviando || estado.finalizado) return;
+    estado.cierreIntegridad = motivo + ' (advertencia ' + estado.integridad.advertencias + ')';
+    estado.integridad.cierre = estado.cierreIntegridad;
+    cerrarModal();
+    enviarQuiz(false);
+  }
+
+  /** Bloquea copiar, cortar, pegar y el menú contextual dentro del quiz. */
+  function alCopiarOPegar(e) {
+    if (!quizEnCurso() || !estado.config || !estado.config.bloquearCopiar) return;
+    if (!$('pantalla-quiz').contains(e.target)) return;
+    e.preventDefault();
+    if (e.type === 'contextmenu') return;
+    estado.integridad.copiados = (estado.integridad.copiados || 0) + 1;
+    mostrarToast(e.type === 'paste' || e.type === 'drop'
+      ? 'No se permite pegar texto durante el quiz. El intento quedó registrado.'
+      : 'No se permite copiar el contenido del quiz. El intento quedó registrado.', 3500);
+    programarGuardado();
+  }
+
+  /** Marca de agua con el nombre y el carné del estudiante sobre la pregunta. */
+  function aplicarMarcaAgua(nombre, carne) {
+    var tarjeta = document.querySelector('.tarjeta-pregunta');
+    if (!tarjeta) return;
+    if (!estado.config || !estado.config.marcaAgua || !carne) {
+      tarjeta.style.backgroundImage = '';
+      return;
+    }
+    var texto = (nombre + ' · ' + carne).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="380" height="190">' +
+      '<text x="190" y="105" text-anchor="middle" transform="rotate(-24 190 95)" fill="#00467f" fill-opacity="0.07" ' +
+      'font-family="Arial, sans-serif" font-size="15" font-weight="bold">' + texto + '</text></svg>';
+    tarjeta.style.backgroundImage = 'url("data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg) + '")';
+    tarjeta.style.backgroundRepeat = 'repeat';
+  }
+
+  function textoContador(n) {
+    return n + '/300 · Enter envía, Shift+Enter cambia de línea';
+  }
+
+  function formatearReloj(segundos) {
+    var m = Math.floor(segundos / 60);
+    var s = segundos % 60;
+    return (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+  }
+
+  // =====================================================================
+  //  INICIALIZACIÓN
+  // =====================================================================
+  function inicializarApp() {
+    aplicarTemaClaro();
+    aplicarLetra(leerPreferencia(CLAVE_LETRA));
+    aplicarContraste(leerPreferencia(CLAVE_CONTRASTE) === '1');
+    $('btn-letra').addEventListener('click', alternarLetra);
+    $('btn-contraste').addEventListener('click', alternarContraste);
+    $('btn-leer').addEventListener('click', alternarLectura);
+    if (lecturaDisponible() && typeof window.speechSynthesis.getVoices === 'function') window.speechSynthesis.getVoices();
+    $('btn-tutor-flotante').addEventListener('click', function () { abrirTutorMovil(true); });
+    $('btn-tutor-cerrar').addEventListener('click', function () { abrirTutorMovil(false); });
+    $('tutor-fondo').addEventListener('click', function () { abrirTutorMovil(false); });
+    $('form-inicio').addEventListener('submit', function (e) {
+      e.preventDefault();
+      confirmarDatosInicio();
+    });
+    ['nombre', 'correo', 'carne', 'grupo', 'codigo'].forEach(function (campo) {
+      $('campo-' + campo).addEventListener('input', function () { limpiarError(campo); });
+    });
+
+    document.addEventListener('visibilitychange', alCambiarVisibilidad);
+    document.addEventListener('visibilitychange', function () {
+      if (!estado.tiempos) return;
+      if (document.hidden) {
+        acumularTiempo();
+        estado.tiempoPausado = true;
+      } else {
+        estado.tiempoPausado = false;
+        estado.tiempoDesde = Date.now();
+      }
+    });
+    window.addEventListener('blur', alPerderFoco);
+    window.addEventListener('focus', alRecuperarFoco);
+    window.addEventListener('resize', alRedimensionar);
+    document.addEventListener('fullscreenchange', alCambiarPantallaCompleta);
+    document.addEventListener('webkitfullscreenchange', alCambiarPantallaCompleta);
+    $('btn-restaurar-ventana').addEventListener('click', function () {
+      intentarPantallaCompleta();
+      setTimeout(function () {
+        evaluarVentana(false);
+        if (exigePantallaCompleta() && !enPantallaCompleta()) {
+          mostrarToast('El navegador no permitió activar la pantalla completa. Vuelve a presionar el botón.', 5000);
+        } else if (estado.ventanaReducida) {
+          mostrarToast('El navegador no permitió agrandarla automáticamente. Maximiza la ventana (doble clic en la barra de título o Windows + ↑).', 6000);
+        }
+      }, 900);
+    });
+    ['copy', 'cut', 'paste', 'drop', 'contextmenu'].forEach(function (tipo) {
+      document.addEventListener(tipo, alCopiarOPegar);
+    });
+    // Elegir un archivo del procedimiento puede ocultar la página en celulares: no cuenta como salida.
+    $('proc-archivo').addEventListener('click', function () { estado.ignorarHasta = Date.now() + 60000; });
+    $('proc-archivo').addEventListener('change', function () { estado.ignorarHasta = Date.now() + 2000; });
+    var opcionesConfianza = document.querySelectorAll('.confianza-opcion');
+    for (var c = 0; c < opcionesConfianza.length; c++) {
+      opcionesConfianza[c].addEventListener('click', function () {
+        var p = estado.preguntas[estado.actual];
+        if (!p || estado.verificadas[p.numero] || estado.verificando || estado.enviando || estado.finalizado) return;
+        estado.confianza[p.numero] = this.getAttribute('data-valor');
+        actualizarVerificacion(p);
+      });
+    }
+    window.addEventListener('offline', function () {
+      if (quizEnCurso()) $('indicador-conexion').classList.remove('oculto');
+    });
+    window.addEventListener('online', function () {
+      if (estado.envioPendiente) {
+        reintentarEnvioPendiente();
+        return;
+      }
+      if (!quizEnCurso()) return;
+      conexionRecuperada();
+      programarGuardado();
+      reintentarVerificacionPendiente();
+    });
+
+    $('btn-anterior').addEventListener('click', function () { irAPregunta(estado.actual - 1); });
+    $('btn-siguiente').addEventListener('click', function () {
+      var p = estado.preguntas[estado.actual];
+      if (estado.secuencial && p && estaRespondida(p) && !estaCompleta(p)) {
+        confirmarVerificacion();
+        return;
+      }
+      irAPregunta(estado.actual + 1);
+    });
+    $('btn-finalizar').addEventListener('click', confirmarFinalizar);
+    $('btn-pista').addEventListener('click', pedirPista);
+    $('btn-verificar').addEventListener('click', confirmarVerificacion);
+    $('tutor-mensaje').addEventListener('input', function () {
+      $('tutor-caracteres').textContent = textoContador(this.value.length);
+      if (estado.preguntas.length) actualizarContadorPistas();
+    });
+    $('tutor-mensaje').addEventListener('keydown', function (e) {
+      if ((e.key === 'Enter' || e.keyCode === 13) && !e.shiftKey && !e.isComposing) {
+        e.preventDefault();
+        pedirPista();
+      }
+    });
+    $('btn-final-accion').addEventListener('click', accionFinal);
+    $('btn-refuerzo').addEventListener('click', iniciarRefuerzo);
+    $('encuesta-niveles').addEventListener('click', elegirNivelEncuesta);
+    $('btn-encuesta').addEventListener('click', enviarEncuesta);
+    $('proc-archivo').addEventListener('change', alElegirArchivos);
+    var radiosModo = document.querySelectorAll('input[name="modo"]');
+    for (var r = 0; r < radiosModo.length; r++) radiosModo[r].addEventListener('change', actualizarModoInicio);
+    if (document.body.getAttribute('data-vista') === 'docente') {
+      iniciarPanelDocente();
+      return;
+    }
+
+    // Advertencia al intentar salir con el quiz en curso.
+    window.addEventListener('beforeunload', function (e) {
+      if (estado.intentoId && !estado.finalizado) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    });
+
+    google.script.run
+      .withSuccessHandler(cargarConfiguracion)
+      .withFailureHandler(function () {
+        $('pantalla-carga').querySelector('p').textContent =
+          'No fue posible cargar el quiz. Recarga la página o avisa a tu docente.';
+      })
+      .obtenerConfiguracionPublica();
+  }
+
+  function cargarConfiguracion(cfg) {
+    estado.config = cfg;
+    $('cab-curso').textContent = cfg.institucion;
+    $('cab-titulo').textContent = cfg.curso;
+    $('inicio-titulo').textContent = cfg.titulo;
+    $('inicio-subtitulo').textContent = cfg.curso + ' · Tema: ' + cfg.tema;
+    $('chip-preguntas').textContent = cfg.preguntasReserva
+      ? cfg.totalPreguntas + ' + ' + cfg.preguntasReserva + ' opcionales'
+      : cfg.totalPreguntas + ' preguntas';
+    $('chip-puntaje').textContent = cfg.puntajeTotal + ' puntos (' + cfg.valorPregunta + ' c/u)';
+    $('chip-tiempo').textContent = cfg.tiempoMinutos + ' minutos';
+    $('chip-intentos').textContent = cfg.variosIntentos ? 'Varios intentos' : '1 intento';
+
+    var textoPistas = 'Puedes pedir hasta ' + cfg.maxPistas + ' pistas por pregunta a Axioma IA.';
+    if (cfg.penalizacionPorPista > 0) {
+      textoPistas += ' Cada pista resta ' + cfg.penalizacionPorPista + ' punto(s) de la nota.';
+    } else {
+      textoPistas += ' Las pistas no restan puntos, pero quedan registradas.';
+    }
+    $('instr-pistas').textContent = textoPistas;
+    $('instr-verificar').classList.toggle('oculto', !cfg.retroInmediata);
+    if (cfg.secuencial) {
+      $('instr-navegacion').textContent = cfg.retroInmediata
+        ? 'Verás una pregunta a la vez, en orden. Debes responder y VERIFICAR cada pregunta antes de avanzar; ' +
+          'mientras no la verifiques no podrás ir adelante ni atrás. Al final debes tener todas verificadas.'
+        : 'Verás una pregunta a la vez, en orden. Debes responder cada pregunta para pasar a la siguiente ' +
+          '(puedes regresar a las anteriores) y responder todas para finalizar.';
+    }
+    if (cfg.controlVentana) {
+      var adv = Math.max(0, Number(cfg.maxAdvertencias) || 0);
+      $('instr-ventana').innerHTML = '';
+      $('instr-ventana').appendChild(crear('strong', null, cfg.pantallaCompleta
+        ? 'La actividad se abre en pantalla completa: no salgas de ella, ni de la pestaña, ni reduzcas la ventana. '
+        : 'No salgas de la pestaña de la actividad ni reduzcas la ventana. '));
+      $('instr-ventana').appendChild(document.createTextNode(adv > 0
+        ? 'La primera vez recibirás una advertencia' + (adv > 1 ? ' (hasta ' + adv + ')' : '') +
+          '; si vuelve a ocurrir, la actividad se cerrará y se enviará automáticamente con las respuestas que tengas.'
+        : 'Si ocurre, la actividad se cerrará y se enviará automáticamente con las respuestas que tengas.'));
+    } else {
+      $('instr-ventana').textContent = '';
+    }
+    if (cfg.bloquearCopiar) {
+      $('instr-ventana').appendChild(document.createTextNode(' Copiar y pegar está deshabilitado y queda registrado.'));
+    }
+    $('instr-ventana').parentNode.classList.toggle('oculto', !$('instr-ventana').textContent.trim());
+
+    if (!cfg.grupoObligatorio) {
+      $('grupo-marca').textContent = '(opcional)';
+      $('grupo-marca').className = 'texto-suave';
+    }
+    if (!cfg.correoObligatorio) {
+      $('correo-marca').textContent = '(opcional)';
+      $('correo-marca').className = 'texto-suave';
+    }
+    $('campo-correo').placeholder = cfg.soloCorreoUcr === false ? 'tu.correo@ejemplo.com' : 'nombre.apellido@' + cfg.dominioCorreo;
+    if (cfg.soloCorreoUcr === false) document.querySelector('label[for="campo-correo"]').firstChild.textContent = 'Correo electrónico ';
+    if (cfg.correoDetectado) {
+      // Correo tomado de la cuenta con la que se abrió la app: no se puede editar.
+      $('campo-correo').value = cfg.correoDetectado;
+      $('campo-correo').readOnly = true;
+    }
+    if (cfg.penalizacionPorPista > 0) {
+      $('tutor-penalizacion').textContent = 'Cada pista resta ' + cfg.penalizacionPorPista + ' punto(s).';
+      $('tutor-penalizacion').classList.remove('oculto');
+    }
+    document.title = cfg.titulo;
+    $('modo-opcion-practica').classList.toggle('oculto', !cfg.permitirPractica);
+    $('modo-opcion-previa').classList.toggle('oculto', !cfg.practicaPrevia);
+    if (cfg.practicaPrevia) {
+      $('modo-previa-texto').textContent = cfg.totalPrevia + ' ejercicios distintos a los del quiz (' + cfg.minutosPrevia +
+        ' min), con solución paso a paso. No cuenta para la nota ni gasta tu intento.';
+    }
+    $('modo-opcion-axioma').classList.toggle('oculto', !cfg.practicaIA);
+    if (cfg.practicaIA) {
+      $('modo-axioma-texto').textContent = cfg.ejerciciosPracticaIA + ' preguntas con la misma temática del quiz, incluidos los 2 ejercicios extra, creadas y revisadas por Axioma IA. ' +
+        'Mismo formato (verificar, pistas, solución e integridad). Al terminar te llegan a tu correo. No cuenta para la nota.';
+    }
+    $('selector-modo').classList.toggle('oculto', !cfg.permitirPractica && !cfg.practicaPrevia && !cfg.practicaIA);
+    if (cfg.practicaIA && !cfg.practicaPrevia) seleccionarModo('axioma');
+    else if (cfg.practicaPrevia && !previaHecha()) seleccionarModo('previa');
+    actualizarModoInicio();
+    mostrarPantalla('pantalla-inicio');
+  }
+
+  var CLAVE_PREVIA = 'quizMA321_previaHecha';
+
+  function previaHecha() {
+    try { return localStorage.getItem(CLAVE_PREVIA) === '1'; } catch (e) { return false; }
+  }
+
+  function marcarPreviaHecha() {
+    try { localStorage.setItem(CLAVE_PREVIA, '1'); } catch (e) { /* almacenamiento no disponible */ }
+  }
+
+  function modoDisponible(modo) {
+    var cfg = estado.config;
+    if (!cfg) return modo === 'evaluado';
+    if (modo === 'practica') return !!cfg.permitirPractica;
+    if (modo === 'previa') return !!cfg.practicaPrevia;
+    if (modo === 'axioma') return !!cfg.practicaIA;
+    return true;
+  }
+
+  function modoSeleccionado() {
+    var marcado = document.querySelector('input[name="modo"]:checked');
+    return marcado && modoDisponible(marcado.value) ? marcado.value : 'evaluado';
+  }
+
+  function seleccionarModo(modo) {
+    var radio = document.querySelector('input[name="modo"][value="' + modo + '"]');
+    if (radio) radio.checked = true;
+  }
+
+  /** Ajusta el aviso y el botón de inicio según el modo elegido. */
+  function actualizarModoInicio() {
+    var cfg = estado.config;
+    if (!cfg) return;
+    var modo = modoSeleccionado();
+    var practica = modo !== 'evaluado';
+    var previa = modo === 'previa';
+    var axioma = modo === 'axioma';
+    var aviso = $('inicio-ventana');
+    var etiquetas = document.querySelectorAll('.modo-opcion');
+    for (var i = 0; i < etiquetas.length; i++) {
+      etiquetas[i].classList.toggle('seleccionada', etiquetas[i].querySelector('input').checked);
+    }
+
+    aviso.className = 'alerta oculto';
+    if (axioma) {
+      aviso.textContent = 'Práctica con Axioma IA: ' + cfg.ejerciciosPracticaIA + ' preguntas con la misma temática del quiz (integrales, áreas entre curvas, etc.), creadas por la IA. Mismo formato que el quiz: opciones, verificar, pistas y solución. Al terminar te enviamos todo a tu correo en PDF.';
+      aviso.className = 'alerta alerta-info';
+    } else if (previa) {
+      aviso.textContent = 'Práctica previa: ejercicios distintos a los del quiz para calentar. Verás la solución paso a paso de cada uno y, al terminar, podrás iniciar el quiz.';
+      aviso.className = 'alerta alerta-info';
+    } else if (practica) {
+      aviso.textContent = 'Modo práctica: tus resultados no cuentan para la nota y verás la solución de cada ejercicio.';
+      aviso.className = 'alerta alerta-info';
+    }
+
+    $('btn-iniciar').disabled = false;
+    $('campo-codigo-grupo').classList.toggle('oculto', practica || !cfg.requiereCodigo);
+    $('btn-iniciar').textContent = axioma ? 'Iniciar práctica con Axioma IA'
+      : (previa ? 'Iniciar práctica previa' : (practica ? 'Iniciar práctica' : 'Iniciar quiz'));
+    if (axioma) {
+      $('chip-preguntas').textContent = cfg.ejerciciosPracticaIA + ' preguntas';
+    } else if (previa) {
+      $('chip-preguntas').textContent = cfg.totalPrevia + ' ejercicios';
+    } else {
+      $('chip-preguntas').textContent = cfg.preguntasReserva
+        ? cfg.totalPreguntas + ' + ' + cfg.preguntasReserva + ' opcionales'
+        : cfg.totalPreguntas + ' preguntas';
+    }
+    $('chip-tiempo').textContent = (axioma ? cfg.minutosPracticaIA : (previa ? cfg.minutosPrevia : cfg.tiempoMinutos)) + ' minutos';
+    $('chip-puntaje').textContent = previa || axioma ? 'No cuenta para la nota' : cfg.puntajeTotal + ' puntos (' + cfg.valorPregunta + ' c/u)';
+    $('chip-intentos').textContent = axioma ? 'Repetible, con otras preguntas'
+      : (previa ? 'Repetible, con otros números' : (cfg.variosIntentos ? 'Varios intentos' : '1 intento'));
+    $('instr-final').textContent = axioma
+      ? 'Al verificar verás si acertaste y la solución paso a paso. Al terminar recibirás en tu correo un PDF con las preguntas y sus soluciones.'
+      : practica
+      ? 'Al finalizar verás tu puntaje, la respuesta correcta y la solución paso a paso de cada pregunta.'
+      : (cfg.mostrarSolucion
+        ? 'Al verificar o finalizar verás si acertaste, la respuesta correcta y la solución paso a paso. También recibirás todo en tu correo, con un PDF.'
+        : 'Al finalizar verás tu nota y retroalimentación por pregunta, pero no la clave de respuestas.');
+  }
+
+  // =====================================================================
+  //  PANTALLA DE INICIO
+  // =====================================================================
+  function marcarError(campo, mensaje) {
+    $('campo-' + campo).classList.add('invalido');
+    $('error-' + campo).textContent = mensaje;
+  }
+
+  function limpiarError(campo) {
+    $('campo-' + campo).classList.remove('invalido');
+    $('error-' + campo).textContent = '';
+    $('inicio-error').classList.add('oculto');
+  }
+
+  /** Validación visual (el servidor vuelve a validar todo). */
+  function validarFormulario() {
+    if (!estado.config) {
+      mostrarToast('La configuración del quiz no se cargó. Recarga la página.', 4000);
+      return false;
+    }
+    var valido = true;
+    var nombre = $('campo-nombre').value.trim();
+    var carne = $('campo-carne').value.replace(/\s+/g, '');
+    var grupo = $('campo-grupo').value.trim();
+    var correo = $('campo-correo').value.trim().toLowerCase();
+    var dominio = estado.config.dominioCorreo.replace(/\./g, '\\.');
+    var soloUcr = estado.config.soloCorreoUcr !== false;
+    var patronCorreo = soloUcr
+      ? new RegExp('^[a-z0-9._%+\\-]+@' + dominio + '$')
+      : /^[a-z0-9._%+\-]+@[a-z0-9\-]+(\.[a-z0-9\-]+)*\.[a-z]{2,}$/;
+
+    ['nombre', 'correo', 'carne', 'grupo', 'codigo'].forEach(limpiarError);
+
+    if (codigoVisible() && !$('campo-codigo').value.trim()) {
+      marcarError('codigo', 'Escribe el código de acceso que te dio tu docente.'); valido = false;
+    }
+    if (estado.config.correoObligatorio && !correo) {
+      marcarError('correo', 'El correo es obligatorio.'); valido = false;
+    } else if (correo && !patronCorreo.test(correo)) {
+      marcarError('correo', soloUcr ? 'Usa tu correo institucional (@' + estado.config.dominioCorreo + ').'
+        : 'Escribe un correo válido.'); valido = false;
+    }
+
+    if (!nombre) {
+      marcarError('nombre', 'Escribe tu nombre completo.'); valido = false;
+    } else if (nombre.length < 5 || !/^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ' .\-]+$/.test(nombre)) {
+      marcarError('nombre', 'Usa solo letras y escribe tu nombre completo.'); valido = false;
+    }
+    if (!carne) {
+      marcarError('carne', 'El carné es obligatorio.'); valido = false;
+    } else if (!/^[A-Za-z0-9\-]{3,20}$/.test(carne)) {
+      marcarError('carne', 'Solo letras, números y guiones (3 a 20 caracteres).'); valido = false;
+    }
+    if (estado.config.grupoObligatorio && !grupo) {
+      marcarError('grupo', 'El grupo es obligatorio.'); valido = false;
+    } else if (grupo && !/^[A-Za-z0-9ÁÉÍÓÚÑáéíóúñ .\-_]+$/.test(grupo)) {
+      marcarError('grupo', 'El grupo contiene caracteres no permitidos.'); valido = false;
+    }
+    return valido;
+  }
+
+  function codigoVisible() {
+    return !$('campo-codigo-grupo').classList.contains('oculto');
+  }
+
+  /** Segundo paso del inicio: el estudiante revisa sus datos antes de que empiece a correr el tiempo. */
+  function confirmarDatosInicio() {
+    if (!validarFormulario()) return;
+    var modo = modoSeleccionado();
+    var cfg = estado.config || {};
+    if (modo === 'evaluado' && cfg.practicaPrevia && !previaHecha() && !estado.previaOfrecida) {
+      abrirModal('Antes de empezar el quiz',
+        'Te recomendamos hacer primero la práctica previa: ' + cfg.totalPrevia + ' ejercicios distintos a los del quiz (' +
+        cfg.minutosPrevia + ' min), con la solución paso a paso de cada uno. No cuenta para la nota ni gasta tu intento.\n\n' +
+        'Al terminarla volverás aquí para iniciar el quiz evaluado.',
+        'Hacer la práctica previa', function () {
+          seleccionarModo('previa');
+          actualizarModoInicio();
+          confirmarDatosInicio();
+        }, 'Ir directo al quiz', function () {
+          estado.previaOfrecida = true;
+          confirmarDatosInicio();
+        });
+      return;
+    }
+    var practica = modo !== 'evaluado';
+    var lineas = [
+      'Nombre: ' + $('campo-nombre').value.trim(),
+      'Carné: ' + $('campo-carne').value.replace(/\s+/g, '')
+    ];
+    if ($('campo-grupo').value.trim()) lineas.push('Grupo: ' + $('campo-grupo').value.trim());
+    if ($('campo-correo').value.trim()) lineas.push('Correo: ' + $('campo-correo').value.trim());
+    if (modo === 'axioma') {
+      if (!$('campo-correo').value.trim()) {
+        marcarError('correo', 'Escribe tu correo para recibir la práctica con las soluciones.');
+        return;
+      }
+      lineas.push('Modo: Práctica con Axioma IA (no cuenta para la nota)');
+      abrirModal('Confirma tus datos', lineas.join('\n') + '\n\nAl terminar te enviaremos las preguntas y sus soluciones a este correo.',
+        'Continuar', function () { mostrarFraseInicio('Iniciar práctica con Axioma IA'); }, 'Corregir datos');
+      return;
+    }
+    lineas.push('Modo: ' + (modo === 'previa' ? 'Práctica previa (no cuenta para la nota)'
+      : (practica ? 'Práctica (no cuenta para la nota)' : 'Quiz evaluado')));
+    var boton = modo === 'previa' ? 'Iniciar práctica previa' : (practica ? 'Iniciar práctica' : 'Iniciar quiz');
+    abrirModal('Confirma tus datos',
+      lineas.join('\n') + '\n\n' + (practica ? 'Al presionar “' + boton + '” comenzará el tiempo.'
+        : 'Al presionar “Iniciar quiz” comenzará a correr el tiempo. Revisa que tus datos estén bien: así aparecerán en tu comprobante.'),
+      'Continuar', function () { mostrarFraseInicio(boton); }, 'Corregir datos');
+  }
+
+  /** Frase de ánimo personal antes de la primera pregunta; el tiempo aún no corre. */
+  function mostrarFraseInicio(textoBoton) {
+    var listo = false;
+    var abrir = function (frase) {
+      if (listo) return;
+      listo = true;
+      ocultarCarga();
+      abrirModal('Un mensaje para ti', frase, textoBoton || 'Iniciar quiz', solicitarInicio, 'Corregir datos');
+      $('modal-texto').className = 'modal-frase';
+    };
+    var nombre = $('campo-nombre').value.trim().split(/\s+/)[0] || '';
+    var respaldo = (nombre ? nombre + ', r' : 'R') + 'espira hondo: llegaste hasta aquí con tu esfuerzo. Confía en ti y avanza con calma.';
+    mostrarCarga('Preparando un mensaje para ti…');
+    setTimeout(function () { abrir(respaldo); }, 3500);
+    google.script.run
+      .withSuccessHandler(function (res) { abrir(res && res.ok && res.frase ? res.frase : respaldo); })
+      .withFailureHandler(function () { abrir(respaldo); })
+      .obtenerFraseInicio({ nombre: $('campo-nombre').value });
+  }
+
+  function solicitarInicio() {
+    if (!validarFormulario()) return;
+    var boton = $('btn-iniciar');
+    boton.disabled = true;
+    var cfg = estado.config;
+    // La pantalla completa solo se puede pedir dentro del clic del estudiante, antes de llamar al servidor.
+    var pedirPantalla = cfg.controlVentana && cfg.pantallaCompleta && !esDispositivoTactil();
+    estado.pantallaCompletaLograda = false;
+    if (pedirPantalla) intentarPantallaCompleta();
+    mostrarCarga(modoSeleccionado() === 'axioma'
+      ? 'Axioma IA está preparando tu práctica… Si tiene que crear y revisar preguntas nuevas, puede tardar hasta 3 minutos; no cierres esta página.'
+      : 'Preparando tu quiz…');
+
+    google.script.run
+      .withSuccessHandler(function (res) {
+        ocultarCarga();
+        boton.disabled = false;
+        if (!res || !res.ok) {
+          if (pedirPantalla) salirPantallaCompleta();
+          if (res && res.campo) marcarError(res.campo, res.mensaje);
+          var error = $('inicio-error');
+          error.textContent = (res && res.mensaje) || 'No fue posible iniciar el quiz.';
+          error.classList.remove('oculto');
+          return;
+        }
+        comenzarQuiz(res);
+      })
+      .withFailureHandler(function () {
+        ocultarCarga();
+        boton.disabled = false;
+        if (pedirPantalla) salirPantallaCompleta();
+        var error = $('inicio-error');
+        error.textContent = 'Error de conexión. Verifica tu internet e intenta de nuevo.';
+        error.classList.remove('oculto');
+      })
+      .iniciarQuiz({
+        nombre: $('campo-nombre').value,
+        correo: $('campo-correo').value,
+        carne: $('campo-carne').value,
+        grupo: $('campo-grupo').value,
+        codigo: codigoVisible() ? $('campo-codigo').value : '',
+        modo: modoSeleccionado(),
+        dispositivo: idDispositivo()
+      });
+  }
+
+  // =====================================================================
+  //  PANTALLA DEL QUIZ
+  // =====================================================================
+  function comenzarQuiz(res) {
+    if (!res || !Array.isArray(res.preguntas) || res.preguntas.length === 0) {
+      ocultarCarga();
+      var boton = $('btn-iniciar');
+      if (boton) boton.disabled = false;
+      var error = $('inicio-error');
+      if (error) {
+        error.textContent = 'No se recibieron preguntas del servidor. Intenta de nuevo.';
+        error.classList.remove('oculto');
+      }
+      if (estado.pantallaCompletaLograda) salirPantallaCompleta();
+      return;
+    }
+    estado.intentoId = res.intentoId;
+    estado.nombre = res.nombre;
+    estado.preguntas = res.preguntas;
+    estado.respuestas = res.respuestas || {};
+    estado.pistas = res.pistas || [];
+    estado.maxPistas = res.maxPistas;
+    estado.retroInmediata = !!res.retroInmediata;
+    estado.verificadas = res.verificadas || {};
+    estado.tiempos = res.tiempos || {};
+    estado.tiempoNumero = null;
+    estado.tiempoDesde = 0;
+    estado.tiempoPausado = !!document.hidden;
+    estado.verificando = false;
+    estado.integridad = res.integridad || {};
+    ['salidas', 'segundosFuera', 'advertencias', 'copiados'].forEach(function (k) {
+      estado.integridad[k] = Number(estado.integridad[k]) || 0;
+    });
+    estado.integridad.incidentes = estado.integridad.incidentes || [];
+    delete estado.integridad.cierre;
+    estado.cierreIntegridad = '';
+    estado.confianza = {};
+    estado.ultimoIncidente = 0;
+    estado.ignorarHasta = 0;
+    estado.ventanaBase = medirVentana();
+    estado.ventanaReducida = false;
+    $('bloqueo-ventana').classList.add('oculto');
+    estado.ocultoDesde = 0;
+    estado.fueraDeFoco = false;
+    estado.chats = {};
+    estado.explicaciones = {};
+    estado.actual = 0;
+    estado.enviando = false;
+    estado.finalizado = false;
+    estado.reintentosEnvio = 0;
+    estado.practica = !!res.practica;
+    estado.secuencial = !!res.secuencial;
+    estado.procedimiento = res.procedimiento || { habilitado: false, obligatorio: false, maxArchivos: 3, archivos: [] };
+    estado.procedimiento.archivos = estado.procedimiento.archivos || [];
+    estado.subiendo = false;
+    estado.bloqueadoDispositivo = false;
+    estado.refuerzo = !!res.refuerzo;
+    estado.previa = !!res.previa;
+    estado.axioma = !!res.axioma;
+    estado.todasPreguntas = (res.preguntas || []).slice();
+    estado.extrasDesbloqueadas = !quizConExtrasOpcionales_();
+    estado.preguntas = preguntasActivas_();
+    $('banda-practica').classList.toggle('oculto', !estado.practica);
+    $('banda-practica').textContent = res.axioma
+      ? 'Práctica con Axioma IA: mismas temáticas y cantidad que el quiz; ejercicios creados por la IA. No cuenta para la nota; al verificar verás la solución y al terminar te llega al correo.'
+      : res.previa
+      ? 'Práctica previa: ejercicios distintos a los del quiz para calentar. No cuenta para la nota; al verificar verás la solución paso a paso.'
+      : res.refuerzo
+      ? 'Práctica de refuerzo: ejercicios parecidos a los que fallaste, con otros números o en otra versión. No cuenta para la nota.'
+      : 'Modo práctica: no cuenta para la nota. Al verificar o finalizar verás la solución paso a paso.';
+    $('btn-finalizar').textContent = estado.practica ? 'Finalizar práctica' : 'Finalizar quiz';
+    renderizarProcedimiento();
+
+    // Si el navegador guardó respuestas que no alcanzaron a llegar al servidor, se recuperan.
+    var respaldo = leerRespaldoLocal(res.intentoId);
+    if (respaldo) {
+      for (var clave in respaldo) {
+        if (respaldo.hasOwnProperty(clave)) estado.respuestas[clave] = respaldo[clave];
+      }
+      programarGuardado();
+    }
+    // Al reanudar: si ya había respondido alguna extra, se desbloquean.
+    if (!estado.extrasDesbloqueadas && estado.todasPreguntas.some(function (p) {
+      return p.reserva && estado.respuestas[String(p.numero)] !== undefined && estado.respuestas[String(p.numero)] !== null;
+    })) {
+      estado.extrasDesbloqueadas = true;
+      estado.preguntas = preguntasActivas_();
+    }
+
+    construirNavegador();
+    deshabilitarControles(false);
+    mostrarPregunta(0);
+    if (quizConExtrasOpcionales_() && !estado.extrasDesbloqueadas) {
+      mostrarToast('Primero las ' + (estado.config.totalPreguntas || 6) +
+        ' preguntas. Al finalizar podrás decidir si haces ' +
+        (estado.config.preguntasReserva || 2) +
+        ' extras opcionales para reponer fallos (si las fallas, no restan).', 7000);
+    }
+    iniciarTemporizador(res.segundosRestantes);
+    iniciarLatido();
+    if (enPantallaCompleta()) estado.pantallaCompletaLograda = true;
+    $('temporizador').classList.remove('oculto');
+    $('barra-tiempo').classList.remove('oculto');
+    $('nav-leyenda').classList.toggle('con-verif', estado.retroInmediata);
+    $('nav-leyenda').classList.toggle('con-secuencial', estado.secuencial);
+    $('indicador-guardado').textContent = '';
+    abrirTutorMovil(false);
+    mostrarPantalla('pantalla-quiz');
+
+    aplicarMarcaAgua(res.nombre, res.carne);
+    if (res.reanudado) {
+      mostrarToast('Se reanudó tu intento en curso. El tiempo siguió corriendo.', 5000);
+    } else if (res.tiempoAdicional > 0) {
+      mostrarToast('Tienes ' + res.tiempoAdicional + ' % de tiempo adicional según la lista oficial del curso.', 6000);
+    }
+  }
+
+  /** El quiz y la Práctica con Axioma IA ofrecen las extras opcionales. */
+  function quizConExtrasOpcionales_() {
+    var n = Number(estado.config && estado.config.preguntasReserva) || 0;
+  if (n <= 0 || estado.previa || estado.refuerzo) return false;
+    return (estado.todasPreguntas || []).some(function (p) { return p.reserva; });
+  }
+
+  function preguntasActivas_() {
+    var todas = estado.todasPreguntas || estado.preguntas || [];
+    if (!quizConExtrasOpcionales_() || estado.extrasDesbloqueadas) return todas.slice();
+    return todas.filter(function (p) { return !p.reserva; });
+  }
+
+  function indicePrimeraExtra_() {
+    for (var i = 0; i < estado.preguntas.length; i++) {
+      if (estado.preguntas[i].reserva) return i;
+    }
+    return -1;
+  }
+
+  function desbloquearExtrasOpcionales_() {
+    estado.extrasDesbloqueadas = true;
+    estado.preguntas = preguntasActivas_();
+    construirNavegador();
+    actualizarNavegador();
+    var i = indicePrimeraExtra_();
+    if (i >= 0) mostrarPregunta(i);
+    mostrarToast('Extras desbloqueadas: son opcionales. Si aciertas, pueden reponer una fallada; si fallas, no restan a la nota.', 6500);
+  }
+
+  function construirNavegador() {
+    var nav = $('navegador-preguntas');
+    nav.innerHTML = '';
+    estado.preguntas.forEach(function (p, i) {
+      var b = crear('button', 'nav-punto' + (p.reserva ? ' nav-reserva' : ''), String(p.posicion));
+      b.type = 'button';
+      b.title = p.reserva
+        ? 'Extra opcional: si aciertas puede reponer una fallada; si fallas, no resta'
+        : 'Ir a la pregunta ' + p.posicion;
+      b.addEventListener('click', function () { irAPregunta(i); });
+      nav.appendChild(b);
+    });
+  }
+
+  function irAPregunta(indice) {
+    if (indice < 0 || indice >= estado.preguntas.length || indice === estado.actual) return;
+    if (estado.secuencial) {
+      var actual = estado.preguntas[estado.actual];
+      if (actual && !estaCompleta(actual)) {
+        mostrarToast(mensajePendiente(actual), 3500);
+        return;
+      }
+      if (indice > limiteNavegacion()) {
+        mostrarToast(mensajePendiente(estado.preguntas[limiteNavegacion()]), 3500);
+        return;
+      }
+    }
+    mostrarPregunta(indice);
+  }
+
+  /** En modo secuencial con verificación, una pregunta está completa solo cuando fue verificada. */
+  function estaCompleta(p) {
+    return estado.retroInmediata ? !!estado.verificadas[p.numero] : estaRespondida(p);
+  }
+
+  function mensajePendiente(p) {
+    if (!estaRespondida(p)) return 'Primero responde la pregunta ' + p.posicion + (estado.retroInmediata ? ' y verifícala.' : '.');
+    return 'Verifica tu respuesta de la pregunta ' + p.posicion + ' para poder continuar.';
+  }
+
+  /** Índice de la primera pregunta sin completar: en modo secuencial no se puede pasar de ahí. */
+  function limiteNavegacion() {
+    for (var i = 0; i < estado.preguntas.length; i++) {
+      if (estado.preguntas[i].reserva) continue;
+      if (!estaCompleta(estado.preguntas[i])) return i;
+    }
+    return estado.preguntas.length - 1;
+  }
+
+  function actualizarBotonesAvance() {
+    if (!estado.preguntas.length) return;
+    var bloqueado = estado.enviando || estado.finalizado;
+    var p = estado.preguntas[estado.actual];
+    var falta = estado.secuencial && !estaCompleta(p);
+    var porVerificar = falta && estaRespondida(p);
+    $('btn-anterior').disabled = bloqueado || falta || estado.actual === 0;
+    $('btn-siguiente').disabled = bloqueado || (falta && !porVerificar) || !!estado.verificando ||
+      estado.actual === estado.preguntas.length - 1;
+    var pendientes = preguntasSinResponder().length;
+    var finBloqueado = estado.secuencial && pendientes > 0;
+    $('btn-finalizar').disabled = bloqueado || finBloqueado;
+    var listoParaExtras = !finBloqueado && quizConExtrasOpcionales_() && !estado.extrasDesbloqueadas;
+    var base = (estado.config && estado.config.totalPreguntas) || 6;
+    $('btn-finalizar').textContent = finBloqueado
+      ? (estado.retroInmediata ? 'Responde y verifica todas las preguntas para finalizar (' : 'Responde todas las preguntas para finalizar (') +
+        pendientes + ' pendiente' + (pendientes === 1 ? '' : 's') + ')'
+      : (listoParaExtras ? 'Terminé las ' + base + ' · elegir extras o entregar'
+        : (estado.practica ? 'Finalizar práctica' : 'Finalizar quiz'));
+    $('aviso-secuencial').textContent = porVerificar
+      ? 'Presiona “Verificar respuesta” para continuar. En este quiz no puedes avanzar ni regresar sin verificar.'
+      : (estado.retroInmediata
+        ? 'Responde y verifica esta pregunta para continuar. En este quiz no puedes avanzar ni regresar sin verificar.'
+        : 'Responde esta pregunta para continuar con la siguiente.');
+    $('aviso-secuencial').classList.toggle('oculto', !falta || bloqueado);
+  }
+
+  function mostrarPregunta(indice) {
+    estado.actual = indice;
+    var p = estado.preguntas[indice];
+    if (!p) {
+      mostrarToast('No se pudo cargar la pregunta ' + (indice + 1) + '.', 4000);
+      return;
+    }
+    var total = estado.preguntas.length;
+    iniciarTiempoPregunta(p.numero);
+
+    var totalBase = (estado.config && estado.config.totalPreguntas) || total;
+    $('progreso-texto').textContent = p.reserva
+      ? 'Extra ' + (p.posicion - totalBase) + ' de ' + ((estado.config && estado.config.preguntasReserva) || (total - totalBase)) + ' (opcional)'
+      : 'Pregunta ' + p.posicion + ' de ' + (estado.extrasDesbloqueadas ? total : totalBase);
+    $('pregunta-etiqueta').textContent = p.reserva
+      ? 'Pregunta extra ' + (p.posicion - (estado.config.totalPreguntas || 6)) + ' (opcional)'
+      : 'Pregunta ' + p.posicion;
+    $('pregunta-tipo').textContent = p.tipoTexto;
+    var valor = estado.config && Number(estado.config.valorPregunta);
+    $('pregunta-puntos').textContent = valor ? (Math.round(valor * 100) / 100) + ' pts' : '';
+    $('pregunta-puntos').classList.toggle('oculto', !valor || estado.practica);
+    $('pregunta-tema').textContent = (p.reserva
+      ? 'Opcional: si acierta, puede reponer una fallada; si falla, no resta a la nota · '
+      : '') + (p.tema || '');
+    $('pregunta-tema').classList.toggle('oculto', !p.tema);
+    var tarjeta = $('tarjeta-pregunta');
+    tarjeta.classList.remove('entrar');
+    void tarjeta.offsetWidth;
+    tarjeta.classList.add('entrar');
+    detenerLectura();
+    $('btn-leer').classList.toggle('oculto', !lecturaDisponible());
+    escribirMat($('pregunta-enunciado'), p.enunciado);
+    dibujarGrafica($('pregunta-grafica'), p.grafica || null);
+
+    renderizarRespuesta(p);
+    actualizarVerificacion(p);
+    actualizarNavegador();
+    renderizarChat();
+
+    actualizarBotonesAvance();
+    $('tutor-mensaje').value = '';
+    $('tutor-caracteres').textContent = textoContador(0);
+  }
+
+  /** Crea el control de respuesta según el tipo de pregunta. */
+  function renderizarRespuesta(p) {
+    var zona = $('pregunta-respuesta');
+    zona.innerHTML = '';
+    var r = estado.respuestas[p.numero];
+
+    if (p.tipo === 'unica') {
+      zona.appendChild(crearGrupoOpciones(p.opciones, 'radio', 'resp-' + p.numero, r ? [r] : [], false, function (sel) {
+        registrarRespuesta(p.numero, sel[0] || null);
+      }));
+
+    } else if (p.tipo === 'pasos') {
+      zona.appendChild(crearGrupoOpciones(p.opciones, 'checkbox', 'resp-' + p.numero, r || [], false, function (sel) {
+        registrarRespuesta(p.numero, sel.length ? sel : null);
+      }));
+
+    } else if (p.tipo === 'vf') {
+      var actual = r || { valor: null, justificacion: null };
+      zona.appendChild(crear('div', 'subtitulo-respuesta', '1. La afirmación es:'));
+      zona.appendChild(crearGrupoOpciones(
+        [{ id: 'V', texto: 'Verdadera' }, { id: 'F', texto: 'Falsa' }],
+        'radio', 'vf-valor-' + p.numero, actual.valor ? [actual.valor] : [], true,
+        function (sel) {
+          actual.valor = sel[0] || null;
+          registrarRespuesta(p.numero, (actual.valor || actual.justificacion) ? { valor: actual.valor, justificacion: actual.justificacion } : null);
+        }));
+      zona.appendChild(crear('div', 'subtitulo-respuesta', '2. Justificación que respalda tu elección:'));
+      zona.appendChild(crearGrupoOpciones(
+        p.justificaciones, 'radio', 'vf-just-' + p.numero, actual.justificacion ? [actual.justificacion] : [], false,
+        function (sel) {
+          actual.justificacion = sel[0] || null;
+          registrarRespuesta(p.numero, (actual.valor || actual.justificacion) ? { valor: actual.valor, justificacion: actual.justificacion } : null);
+        }));
+
+    } else {
+      // Respuesta numérica o corta
+      var input = document.createElement('input');
+      input.type = 'text';
+      input.id = 'resp-texto';
+      input.maxLength = p.tipo === 'numerica' ? 30 : 80;
+      input.autocomplete = 'off';
+      input.placeholder = p.tipo === 'numerica' ? 'Escribe tu respuesta numérica' : 'Escribe tu respuesta';
+      if (p.tipo === 'numerica' && p.simbolos !== 'trascendentes') input.inputMode = 'decimal';
+      input.value = r || '';
+
+      // Barra de símbolos: inserta en la posición del cursor.
+      var botones = p.tipo === 'corta'
+        ? [['x', 'x', 0], ['x²', '^2', 0], ['xⁿ', '^()', 1], ['√', '^(1/2)', 0], ['a/b', '/', 0], ['( )', '()', 1], ['−', '-', 0]]
+        : [['a/b', '/', 0], ['( )', '()', 1], ['−', '-', 0], ['.', '.', 0]];
+      if (p.simbolos === 'trascendentes') {
+        botones = botones.concat(p.tipo === 'corta'
+          ? [['sen', 'sin()', 1], ['cos', 'cos()', 1], ['eˣ', 'e^x', 0], ['ln', 'ln()', 1]]
+          : [['π', 'pi', 0], ['e', 'e', 0], ['ln', 'ln()', 1], ['√', 'sqrt()', 1]]);
+      }
+      var barra = crear('div', 'barra-formulas');
+      barra.setAttribute('aria-label', 'Insertar símbolos');
+      botones.forEach(function (b) {
+        var boton = crear('button', 'btn-formula', b[0]);
+        boton.type = 'button';
+        boton.title = 'Insertar ' + b[1];
+        boton.addEventListener('mousedown', function (e) { e.preventDefault(); });
+        boton.addEventListener('click', function () { insertarEnCampo(input, b[1], b[2]); });
+        barra.appendChild(boton);
+      });
+
+      // Vista previa con notación matemática de lo que escribe el estudiante.
+      var vista = crear('div', 'vista-previa');
+      var actualizarVista = function () {
+        vista.innerHTML = '';
+        vista.appendChild(crear('span', 'vista-previa-etiqueta', 'Así se interpreta:'));
+        var contenido = crear('span');
+        var valor = input.value.trim();
+        if (valor) {
+          var r = expresionATex(valor);
+          if (r.ok && r.tex) {
+            escribirMat(contenido, '$' + r.tex + '$');
+          } else {
+            contenido.textContent = valor.replace(/\$/g, '');
+            vista.appendChild(contenido);
+            vista.appendChild(crear('span', 'vista-previa-aviso', ' (expresión incompleta: revisa paréntesis y operadores)'));
+            return;
+          }
+        }
+        vista.appendChild(contenido);
+      };
+
+      input.addEventListener('input', function () {
+        var valor = input.value.trim();
+        registrarRespuesta(p.numero, valor ? valor : null);
+        actualizarVista();
+      });
+      zona.appendChild(barra);
+      zona.appendChild(input);
+      zona.appendChild(vista);
+      if (p.tipo === 'corta') {
+        zona.appendChild(crear('p', 'ayuda-formulas',
+          'Escribe potencias con ^ (x^3), raíces como potencias (x^(1/2)) y usa paréntesis en denominadores: 1/(2x^2).'));
+      }
+      actualizarVista();
+    }
+
+    if (p.indicacion) zona.appendChild(crear('p', 'indicacion', p.indicacion));
+  }
+
+  /** Grupo de opciones (radio o checkbox) con letra y texto. */
+  function crearGrupoOpciones(opciones, tipoInput, nombre, seleccionados, esVF, alCambiar) {
+    var grupo = crear('div', 'opciones' + (esVF ? ' opciones-vf' : ''));
+    (opciones || []).forEach(function (op) {
+      var etiqueta = crear('label', 'opcion');
+      var input = document.createElement('input');
+      input.type = tipoInput;
+      input.name = nombre;
+      input.value = op.id;
+      input.checked = seleccionados.indexOf(op.id) !== -1;
+      if (input.checked) etiqueta.classList.add('seleccionada');
+
+      input.addEventListener('change', function () {
+        var marcados = grupo.querySelectorAll('input:checked');
+        var valores = [];
+        for (var i = 0; i < marcados.length; i++) valores.push(marcados[i].value);
+        var etiquetas = grupo.querySelectorAll('.opcion');
+        for (var j = 0; j < etiquetas.length; j++) {
+          etiquetas[j].classList.toggle('seleccionada', etiquetas[j].querySelector('input').checked);
+        }
+        alCambiar(valores);
+      });
+
+      etiqueta.appendChild(input);
+      if (!esVF) etiqueta.appendChild(crear('span', 'opcion-letra', op.id));
+      var textoOpcion = crear('span', 'opcion-texto');
+      escribirMat(textoOpcion, fraccionesGrandes(op.texto));
+      etiqueta.appendChild(textoOpcion);
+      var marca = crear('span', 'opcion-check');
+      marca.appendChild(icono('check'));
+      etiqueta.appendChild(marca);
+      grupo.appendChild(etiqueta);
+    });
+    return grupo;
+  }
+
+  /** Guarda la respuesta en memoria y programa el respaldo en el servidor. */
+  function registrarRespuesta(numero, valor) {
+    if (estado.enviando || estado.finalizado) return;
+    if (estado.verificadas[numero] || estado.verificando === numero) return;
+    if (valor === null) {
+      delete estado.respuestas[numero];
+    } else {
+      estado.respuestas[numero] = valor;
+    }
+    guardarRespaldoLocal();
+    actualizarNavegador();
+    actualizarVerificacion(estado.preguntas[estado.actual]);
+    programarGuardado();
+  }
+
+  // =====================================================================
+  //  RETROALIMENTACIÓN INMEDIATA (la respuesta queda fija al verificarla)
+  // =====================================================================
+  function actualizarVerificacion(p) {
+    var boton = $('btn-verificar');
+    var panel = $('pregunta-retro');
+    var item = estado.verificadas[p.numero];
+
+    var caja = $('confianza');
+    if (item) {
+      var entradas = document.querySelectorAll('#pregunta-respuesta input, #pregunta-respuesta button');
+      for (var i = 0; i < entradas.length; i++) entradas[i].disabled = true;
+      var elegidas = document.querySelectorAll('#pregunta-respuesta .opcion.seleccionada');
+      for (var s = 0; s < elegidas.length; s++) elegidas[s].classList.add('verif-' + item.estado);
+      var campoTexto = $('resp-texto');
+      if (campoTexto) campoTexto.classList.add('verif-' + item.estado);
+      boton.classList.add('oculto');
+      caja.classList.add('oculto');
+      mostrarRetroInmediata(item);
+      return;
+    }
+    panel.classList.add('oculto');
+    panel.innerHTML = '';
+
+    var pedirConfianza = !!(estado.config && estado.config.pedirConfianza);
+    var elegida = estado.confianza[p.numero] || '';
+    caja.classList.toggle('oculto', !pedirConfianza || !estaRespondida(p));
+    var opciones = caja.querySelectorAll('.confianza-opcion');
+    for (var k = 0; k < opciones.length; k++) {
+      var activa = opciones[k].getAttribute('data-valor') === elegida;
+      opciones[k].classList.toggle('seleccionada', activa);
+      opciones[k].setAttribute('aria-pressed', activa ? 'true' : 'false');
+      opciones[k].disabled = estado.enviando || estado.finalizado || !!estado.verificando;
+    }
+
+    if (!estado.retroInmediata) {
+      boton.classList.add('oculto');
+      return;
+    }
+    var faltaConfianza = pedirConfianza && !elegida;
+    boton.classList.remove('oculto');
+    boton.disabled = estado.enviando || estado.finalizado || !!estado.verificando || !estaRespondida(p) || faltaConfianza;
+    boton.textContent = estado.verificando === p.numero ? 'Verificando…'
+      : (estaRespondida(p) && faltaConfianza ? 'Indica tu nivel de confianza para verificar' : 'Verificar respuesta');
+  }
+
+  function mostrarRetroInmediata(item) {
+    var panel = $('pregunta-retro');
+    var titulos = { correcta: '¡Correcto!', parcial: 'Parcialmente correcta', incorrecta: 'Incorrecta' };
+    var iconos = { correcta: 'check', parcial: 'parcial', incorrecta: 'x' };
+    panel.innerHTML = '';
+    panel.className = 'retro-inmediata ' + item.estado;
+    var cabecera = crear('div', 'retro-cabecera');
+    var circulo = crear('span', 'retro-icono');
+    circulo.appendChild(icono(iconos[item.estado] || 'parcial'));
+    cabecera.appendChild(circulo);
+    var textos = crear('div');
+    textos.appendChild(crear('div', 'retro-titulo', titulos[item.estado] || ''));
+    textos.appendChild(crear('div', 'retro-subtitulo', 'Tu respuesta quedó registrada.'));
+    cabecera.appendChild(textos);
+    panel.appendChild(cabecera);
+
+    if (item.comentarioError) {
+      var comentario = crear('p');
+      escribirMat(comentario, item.comentarioError);
+      panel.appendChild(comentario);
+    }
+    agregarSolucion(panel, item);
+    if (item.explicable) agregarExplicacionError(panel, item.numero);
+  }
+
+  /** Práctica: Axioma IA explica en qué paso se equivocó el estudiante (después de verificar). */
+  function agregarExplicacionError(contenedor, numero) {
+    estado.explicaciones = estado.explicaciones || {};
+    var caja = crear('div', 'explicacion-error');
+    var guardada = estado.explicaciones[numero];
+    if (guardada && guardada.texto) {
+      caja.appendChild(crear('div', 'explicacion-titulo', 'Axioma IA: tu error'));
+      var p = crear('p');
+      escribirMat(p, guardada.texto);
+      caja.appendChild(p);
+      contenedor.appendChild(caja);
+      return;
+    }
+    var boton = crear('button', 'btn btn-secundario', guardada && guardada.cargando ? 'Axioma IA está revisando tu respuesta…' : 'Explícame mi error');
+    boton.type = 'button';
+    boton.disabled = !!(guardada && guardada.cargando);
+    boton.addEventListener('click', function () {
+      estado.explicaciones[numero] = { cargando: true };
+      boton.disabled = true;
+      boton.textContent = 'Axioma IA está revisando tu respuesta…';
+      google.script.run
+        .withSuccessHandler(function (res) {
+          if (res && res.ok) {
+            estado.explicaciones[numero] = { texto: res.texto };
+          } else {
+            delete estado.explicaciones[numero];
+            mostrarToast((res && res.mensaje) || 'No fue posible obtener la explicación.', 4500);
+          }
+          refrescarSiVisible(numero);
+        })
+        .withFailureHandler(function () {
+          delete estado.explicaciones[numero];
+          mostrarToast('Sin conexión: intenta de nuevo en un momento.', 4500);
+          refrescarSiVisible(numero);
+        })
+        .explicarMiError({ intentoId: estado.intentoId, numeroPregunta: numero });
+    });
+    caja.appendChild(boton);
+    contenedor.appendChild(caja);
+  }
+
+  /** Solo en modo práctica: respuesta correcta y solución paso a paso. */
+  function agregarSolucion(contenedor, item) {
+    if (!item.respuestaCorrecta && !(item.solucion && item.solucion.length)) return;
+    var caja = crear('div', 'solucion');
+    if (item.respuestaCorrecta) {
+      var correcta = crear('p', 'solucion-respuesta');
+      correcta.appendChild(crear('strong', null, 'Respuesta correcta: '));
+      var valor = crear('span');
+      escribirMat(valor, fraccionesGrandes(item.respuestaCorrecta));
+      correcta.appendChild(valor);
+      caja.appendChild(correcta);
+    }
+    if (item.solucion && item.solucion.length) {
+      caja.appendChild(crear('div', 'solucion-titulo', 'Solución paso a paso'));
+      var pasos = crear('ol', 'solucion-pasos');
+      item.solucion.forEach(function (paso) {
+        var li = crear('li');
+        escribirMat(li, fraccionesGrandes(paso));
+        pasos.appendChild(li);
+      });
+      caja.appendChild(pasos);
+    }
+    contenedor.appendChild(caja);
+  }
+
+  function confirmarVerificacion() {
+    var p = estado.preguntas[estado.actual];
+    if (!estado.retroInmediata || estado.verificadas[p.numero] || estado.verificando || !estaRespondida(p)) return;
+    if (estado.config && estado.config.pedirConfianza && !estado.confianza[p.numero]) {
+      mostrarToast('Antes de verificar, indica qué tan seguro estás de tu respuesta.', 3500);
+      return;
+    }
+    abrirModal('¿Verificar esta respuesta?',
+      'Sabrás de inmediato si es correcta, pero después ya no podrás cambiarla.\n\n¿Deseas verificarla?',
+      'Sí, verificar', function () { verificarPregunta(p); }, 'Revisar otra vez');
+  }
+
+  /** Repite la verificación que falló por conexión, solo si la respuesta no cambió desde entonces. */
+  function reintentarVerificacionPendiente() {
+    var pendiente = estado.verificacionPendiente;
+    estado.verificacionPendiente = null;
+    if (!pendiente || !quizEnCurso() || estado.verificando || estado.verificadas[pendiente.numero]) return;
+    if (JSON.stringify(estado.respuestas[pendiente.numero] || null) !== pendiente.respuesta) return;
+    for (var i = 0; i < estado.preguntas.length; i++) {
+      if (estado.preguntas[i].numero === pendiente.numero) {
+        verificarPregunta(estado.preguntas[i]);
+        return;
+      }
+    }
+  }
+
+  function verificarPregunta(p) {
+    var numero = p.numero;
+    estado.verificacionPendiente = null;
+    acumularTiempo();
+    estado.verificando = numero;
+    refrescarSiVisible(numero);
+
+    google.script.run
+      .withSuccessHandler(function (res) {
+        estado.verificando = false;
+        if (res && res.ok) {
+          estado.verificadas[numero] = res.item;
+          actualizarNavegador();
+        } else {
+          mostrarToast((res && res.mensaje) || 'No fue posible verificar la respuesta.', 4500);
+        }
+        refrescarSiVisible(numero);
+      })
+      .withFailureHandler(function () {
+        estado.verificando = false;
+        estado.verificacionPendiente = { numero: numero, respuesta: JSON.stringify(estado.respuestas[numero] || null) };
+        mostrarToast('Sin conexión: la respuesta se verificará sola cuando vuelva el internet (o presiona Verificar de nuevo).', 6000);
+        refrescarSiVisible(numero);
+      })
+      .verificarRespuesta({
+        intentoId: estado.intentoId,
+        numeroPregunta: numero,
+        respuesta: estado.respuestas[numero] || null,
+        confianza: estado.confianza[numero] || ''
+      });
+  }
+
+  function refrescarSiVisible(numero) {
+    var actual = estado.preguntas[estado.actual];
+    if (actual && actual.numero === numero) {
+      actualizarVerificacion(actual);
+      actualizarContadorPistas();
+    }
+  }
+
+  function programarGuardado() {
+    clearTimeout(estado.temporizadorGuardado);
+    estado.temporizadorGuardado = setTimeout(guardarAhora, 1500);
+    if (quizEnCurso()) mostrarEstadoGuardado('guardando');
+  }
+
+  /**
+   * Envía respuestas, integridad y la pregunta actual (para el monitoreo en vivo del docente).
+   * La respuesta trae el tiempo restante: si el docente concedió tiempo extra, el reloj se ajusta.
+   */
+  function guardarAhora() {
+    if (!estado.intentoId || estado.finalizado || estado.enviando) return;
+    var actual = estado.preguntas[estado.actual];
+    google.script.run
+      .withSuccessHandler(function (res) {
+        if (res && res.otroDispositivo) {
+          bloquearPorOtroDispositivo();
+          return;
+        }
+        if (!estado.finalizado && !estado.enviando) mostrarEstadoGuardado(res && res.ok ? 'guardado' : 'error');
+        if (estado.fallosGuardado >= FALLOS_PARA_AVISO_CONEXION) conexionRecuperada();
+        estado.fallosGuardado = 0;
+        if (estado.verificacionPendiente) reintentarVerificacionPendiente();
+        ajustarTiempoServidor(res);
+      })
+      .withFailureHandler(function () {
+        // Se reintenta en el siguiente guardado; queda el respaldo local.
+        estado.fallosGuardado = (estado.fallosGuardado || 0) + 1;
+        if (estado.finalizado || estado.enviando) return;
+        mostrarEstadoGuardado('error');
+        if (estado.fallosGuardado >= FALLOS_PARA_AVISO_CONEXION) $('indicador-conexion').classList.remove('oculto');
+        clearTimeout(estado.temporizadorGuardado);
+        estado.temporizadorGuardado = setTimeout(guardarAhora, ESPERA_REINTENTO_ENVIO_MS);
+      })
+      .guardarProgreso(estado.intentoId, estado.respuestas, estado.integridad,
+        { posicion: actual ? actual.posicion : 0, dispositivo: idDispositivo(), tiempos: tiemposParaEnviar() });
+  }
+
+  // ---------- Tiempo por pregunta ----------
+  /** Suma al contador de la pregunta visible el tiempo desde la última marca (sin contar la pestaña oculta). */
+  function acumularTiempo() {
+    var ahora = Date.now();
+    var numero = estado.tiempoNumero;
+    var desde = estado.tiempoDesde || ahora;
+    estado.tiempoDesde = ahora;
+    if (!numero || !estado.intentoId || estado.finalizado || estado.tiempoPausado || estado.verificadas[numero]) return;
+    var segundos = (ahora - desde) / 1000;
+    if (segundos <= 0 || segundos > 3600) return;
+    estado.tiempos[numero] = (Number(estado.tiempos[numero]) || 0) + segundos;
+  }
+
+  function iniciarTiempoPregunta(numero) {
+    acumularTiempo();
+    estado.tiempoNumero = numero;
+    estado.tiempoDesde = Date.now();
+  }
+
+  function tiemposParaEnviar() {
+    acumularTiempo();
+    var salida = {};
+    Object.keys(estado.tiempos || {}).forEach(function (n) {
+      var s = Math.round(Number(estado.tiempos[n]) || 0);
+      if (s > 0) salida[n] = s;
+    });
+    return salida;
+  }
+
+  function ajustarTiempoServidor(res) {
+    if (!res || !res.ok || typeof res.segundosRestantes !== 'number' || estado.finalizado || estado.enviando) return;
+    var finServidor = Date.now() + res.segundosRestantes * 1000;
+    if (finServidor - estado.fin > 20000) {
+      var minutos = Math.round((finServidor - estado.fin) / 60000);
+      estado.fin = finServidor;
+      estado.totalSegundos = Math.max(estado.totalSegundos || 0, res.segundosRestantes);
+      // Con más tiempo, los avisos que quedaron en el futuro vuelven a mostrarse.
+      var restantes = res.segundosRestantes;
+      estado.avisosTiempo = (estado.avisosTiempo || []).filter(function (s) { return s >= restantes; });
+      actualizarTemporizador();
+      mostrarToast('Tu docente te concedió ' + (minutos > 0 ? minutos + ' minuto(s) de ' : '') + 'tiempo adicional.', 6000);
+    }
+  }
+
+  /** Señal periódica para que el docente vea quién sigue conectado. */
+  function iniciarLatido() {
+    clearInterval(estado.latido);
+    if (estado.practica) return;
+    estado.latido = setInterval(guardarAhora, 30000);
+  }
+
+  function estaRespondida(p) {
+    var r = estado.respuestas[p.numero];
+    if (!r) return false;
+    if (p.tipo === 'vf') return !!(r.valor && r.justificacion);
+    if (p.tipo === 'pasos') return r.length > 0;
+    return String(r).trim().length > 0;
+  }
+
+  function actualizarNavegador() {
+    var botones = $('navegador-preguntas').children;
+    var respondidas = 0;
+    var limite = estado.secuencial ? limiteNavegacion() : estado.preguntas.length;
+    var bloqueado = estado.enviando || estado.finalizado;
+    var actualPendiente = estado.secuencial && estado.preguntas[estado.actual] && !estaCompleta(estado.preguntas[estado.actual]);
+    estado.preguntas.forEach(function (p, i) {
+      var ok = estaRespondida(p);
+      if (ok) respondidas++;
+      botones[i].classList.toggle('respondida', ok);
+      botones[i].classList.toggle('actual', i === estado.actual);
+      var cerrada = i > limite || (actualPendiente && i !== estado.actual);
+      botones[i].classList.toggle('bloqueada', cerrada);
+      botones[i].disabled = bloqueado || cerrada;
+      var item = estado.verificadas[p.numero];
+      ['correcta', 'parcial', 'incorrecta'].forEach(function (e) {
+        botones[i].classList.toggle('verif-' + e, !!item && item.estado === e);
+      });
+      var detalle = item ? 'verificada, ' + item.estado : (ok ? 'respondida' : 'sin responder');
+      botones[i].setAttribute('aria-label', 'Pregunta ' + p.posicion + ', ' + detalle + (cerrada ? ', bloqueada' : ''));
+      if (i === estado.actual) botones[i].setAttribute('aria-current', 'step');
+      else botones[i].removeAttribute('aria-current');
+    });
+    var porcentaje = Math.round(respondidas / estado.preguntas.length * 100);
+    $('respondidas-texto').textContent = respondidas + ' de ' + estado.preguntas.length + ' respondidas · ' + porcentaje + ' %';
+    $('barra-progreso-relleno').style.width = Math.max(porcentaje, 2) + '%';
+    actualizarBotonesAvance();
+  }
+
+  function preguntasSinResponder() {
+    return estado.preguntas.filter(function (p) {
+      return !p.reserva && (estado.secuencial ? !estaCompleta(p) : !estaRespondida(p));
+    })
+      .map(function (p) { return p.posicion; });
+  }
+
+  function preguntaPorNumero(numero) {
+    for (var i = 0; i < estado.preguntas.length; i++) {
+      if (estado.preguntas[i].numero === numero) return estado.preguntas[i];
+    }
+    return null;
+  }
+
+  // =====================================================================
+  //  TEMPORIZADOR
+  // =====================================================================
+  var AVISOS_TIEMPO = [600, 300, 60];
+
+  function iniciarTemporizador(segundos) {
+    clearInterval(estado.intervalo);
+    estado.fin = Date.now() + segundos * 1000;
+    var configurados = estado.config && !estado.refuerzo && !estado.previa && !estado.axioma ? Number(estado.config.tiempoMinutos) * 60 : 0;
+    estado.totalSegundos = Math.max(segundos, configurados || 0, 1);
+    // Los avisos cuyo momento ya pasó (por ejemplo, al reanudar) no se muestran.
+    estado.avisosTiempo = AVISOS_TIEMPO.filter(function (s) { return segundos <= s; });
+    actualizarTemporizador();
+    estado.intervalo = setInterval(actualizarTemporizador, 500);
+  }
+
+  function avisarTiempo(segundos) {
+    var minutos = segundos / 60;
+    mostrarToast(minutos === 1
+      ? 'Queda 1 minuto. Revisa tu respuesta actual: al terminar el tiempo el quiz se envía solo.'
+      : 'Quedan ' + minutos + ' minutos.', 6000);
+    var caja = $('temporizador');
+    caja.classList.remove('pulso-tiempo');
+    void caja.offsetWidth;
+    caja.classList.add('pulso-tiempo');
+    if (navigator.vibrate) {
+      try { navigator.vibrate(minutos === 1 ? [300, 150, 300, 150, 300] : [250, 120, 250]); } catch (e) { /* sin vibración */ }
+    }
+  }
+
+  function actualizarTemporizador() {
+    var restantes = Math.max(0, Math.round((estado.fin - Date.now()) / 1000));
+    var caja = $('temporizador');
+    $('tiempo-restante').textContent = formatearReloj(restantes);
+    var fraccion = Math.max(0, Math.min(1, restantes / (estado.totalSegundos || 1)));
+    $('anillo-progreso').style.strokeDashoffset = String(119.38 * (1 - fraccion));
+    $('barra-tiempo-relleno').style.width = (fraccion * 100) + '%';
+    var advertencia = restantes <= 300 && restantes > 60;
+    var critico = restantes <= 60;
+    [caja, $('barra-tiempo')].forEach(function (el) {
+      el.classList.toggle('advertencia', advertencia);
+      el.classList.toggle('critico', critico);
+    });
+    if (restantes > 0 && !estado.enviando && !estado.finalizado) {
+      AVISOS_TIEMPO.forEach(function (s) {
+        if (restantes <= s && estado.avisosTiempo.indexOf(s) === -1) {
+          estado.avisosTiempo.push(s);
+          if (restantes > s - 30) avisarTiempo(s);
+        }
+      });
+    }
+
+    if (restantes <= 0 && !estado.enviando && !estado.finalizado) {
+      cerrarModal();
+      mostrarToast('El tiempo terminó. Tu quiz se está enviando automáticamente.', 5000);
+      enviarQuiz(true);
+    }
+  }
+
+  // =====================================================================
+  //  AXIOMA IA
+  // =====================================================================
+  function agregarMensajeChat(numero, rol, texto) {
+    if (!estado.chats[numero]) estado.chats[numero] = [];
+    estado.chats[numero].push({ rol: rol, texto: texto, hora: horaActual() });
+    if (estado.preguntas[estado.actual] && estado.preguntas[estado.actual].numero === numero) renderizarChat();
+  }
+
+  function renderizarChat() {
+    var p = estado.preguntas[estado.actual];
+    var chat = $('tutor-chat');
+    chat.innerHTML = '';
+    var mensajes = estado.chats[p.numero] || [];
+
+    if (!mensajes.length) {
+      chat.appendChild(crear('p', 'chat-vacio', '¿Atascado? Escribe tu duda y presiona Enter: Axioma IA te hará una pregunta o te dará una orientación para avanzar.'));
+    }
+    mensajes.forEach(function (m) {
+      var burbuja = crear('div', 'burbuja burbuja-' + m.rol);
+      if (m.rol === 'estudiante') {
+        burbuja.textContent = m.texto;
+      } else {
+        escribirMat(burbuja, m.texto);
+      }
+      if (m.hora) burbuja.appendChild(crear('span', 'burbuja-hora', m.hora));
+      chat.appendChild(burbuja);
+    });
+    if (estado.pidiendoPista === p.numero) {
+      chat.appendChild(crear('div', 'burbuja burbuja-tutor escribiendo', 'Axioma IA está analizando tu consulta…'));
+    }
+    chat.scrollTop = chat.scrollHeight;
+    actualizarContadorPistas();
+  }
+
+  function actualizarContadorPistas() {
+    var p = estado.preguntas[estado.actual];
+    var usadas = estado.pistas[p.numero - 1] || 0;
+    var max = estado.maxPistas;
+    $('tutor-contador').textContent = usadas + '/' + max;
+    var puntos = $('tutor-puntos');
+    puntos.innerHTML = '';
+    for (var k = 0; k < max; k++) puntos.appendChild(crear('i', k < usadas ? 'usada' : ''));
+    $('btn-tutor-flotante').classList.toggle('con-mensajes', !!(estado.chats[p.numero] && estado.chats[p.numero].length));
+    var verificada = !!estado.verificadas[p.numero];
+    var agotadas = usadas >= max;
+    var conTexto = $('tutor-mensaje').value.trim().length > 0;
+    $('btn-pista').disabled = estado.enviando || estado.finalizado || !!estado.pidiendoPista || verificada || (agotadas && !conTexto);
+    $('btn-pista').textContent = verificada ? 'Pregunta ya verificada'
+      : (agotadas ? (conTexto ? 'Responder a Axioma IA' : 'Pistas agotadas: escribe tu duda') : (conTexto ? 'Enviar y pedir pista' : 'Pedir una pista'));
+    $('btn-pista').title = agotadas ? 'Ya no recibirás pistas nuevas, pero Axioma IA responde a tus comentarios sin descontar pistas.' : '';
+  }
+
+  function motivoPistaBloqueada() {
+    if (!estado.preguntas.length) return 'Espera a que cargue la pregunta.';
+    var p = estado.preguntas[estado.actual];
+    if (estado.enviando || estado.finalizado) return 'El quiz ya se envió o se está enviando.';
+    if (estado.verificadas[p.numero]) return 'Esta pregunta ya está verificada. Axioma IA queda para las que faltan.';
+    var usadas = estado.pistas[p.numero - 1] || 0;
+    if (usadas >= estado.maxPistas && !$('tutor-mensaje').value.trim()) {
+      return 'Ya usaste tus pistas. Escribe tu duda y pulsa Enviar.';
+    }
+    if (estado.pidiendoPista && Date.now() - (estado.pistaDesde || 0) < 8000) {
+      return 'Axioma IA todavía está contestando. Espera unos segundos.';
+    }
+    return '';
+  }
+
+  function pedirPista() {
+    var motivo = motivoPistaBloqueada();
+    if (motivo) {
+      mostrarToast(motivo, 4500);
+      return;
+    }
+    var p = estado.preguntas[estado.actual];
+    var numero = p.numero;
+    var mensaje = $('tutor-mensaje').value.trim().slice(0, 300);
+    if ((estado.pistas[numero - 1] || 0) >= estado.maxPistas && !mensaje) {
+      mostrarToast('Ya usaste tus pistas. Escribe tu duda o lo que intentaste y Axioma IA te responderá sin descontar pistas.', 4500);
+      return;
+    }
+
+    if (mensaje) agregarMensajeChat(numero, 'estudiante', mensaje);
+    $('tutor-mensaje').value = '';
+    $('tutor-caracteres').textContent = textoContador(0);
+
+    var reqId = (estado.pistaReq = (estado.pistaReq || 0) + 1);
+    estado.pidiendoPista = numero;
+    estado.pistaDesde = Date.now();
+    if (estado.pistaTimer) clearTimeout(estado.pistaTimer);
+    estado.pistaTimer = setTimeout(function () {
+      if (estado.pistaReq !== reqId) return;
+      estado.pidiendoPista = false;
+      agregarMensajeChat(numero, 'sistema', 'Axioma IA tardó esta vez. Vuelve a enviar: te responde con la pista local.');
+      renderizarChat();
+    }, 28000);
+    renderizarChat();
+
+    google.script.run
+      .withSuccessHandler(function (res) {
+        if (estado.pistaReq !== reqId) return;
+        if (estado.pistaTimer) clearTimeout(estado.pistaTimer);
+        estado.pidiendoPista = false;
+        var lista = estado.chats[numero] || [];
+        if (lista.length && lista[lista.length - 1].rol === 'sistema' && /tardó demasiado/.test(lista[lista.length - 1].texto)) {
+          lista.pop();
+        }
+        if (res && res.ok) {
+          estado.pistas[numero - 1] = res.pistasUsadas;
+          agregarMensajeChat(numero, res.limite ? 'sistema' : 'tutor', res.texto);
+        } else {
+          agregarMensajeChat(numero, 'sistema', (res && res.mensaje) || 'Axioma IA no está disponible. Intenta de nuevo.');
+        }
+        renderizarChat();
+      })
+      .withFailureHandler(function () {
+        if (estado.pistaReq !== reqId) return;
+        if (estado.pistaTimer) clearTimeout(estado.pistaTimer);
+        estado.pidiendoPista = false;
+        agregarMensajeChat(numero, 'sistema', 'No hubo conexión con Axioma IA. Intenta de nuevo.');
+        renderizarChat();
+      })
+      .consultarTutorGuia({
+        intentoId: estado.intentoId,
+        numeroPregunta: numero,
+        respuesta: estado.respuestas[numero] || null,
+        mensaje: mensaje
+      });
+  }
+
+  // =====================================================================
+  //  FINALIZACIÓN
+  // =====================================================================
+  function confirmarFinalizar() {
+    if (estado.enviando || estado.finalizado) return;
+    if (estado.subiendo) {
+      mostrarToast('Espera a que termine de subirse tu archivo.', 3500);
+      return;
+    }
+    var proc = estado.procedimiento;
+    if (proc.habilitado && proc.obligatorio && !proc.archivos.length) {
+      abrirModal('Falta tu procedimiento',
+        'Antes de finalizar debes adjuntar al menos una foto o un PDF con tu procedimiento escrito (sección “Procedimiento escrito”, debajo de la pregunta).',
+        'Entendido', function () { $('procedimiento').scrollIntoView({ behavior: 'smooth' }); }, null);
+      return;
+    }
+    var pendientes = preguntasSinResponder();
+    if (estado.secuencial && pendientes.length) {
+      mostrarToast('Debes responder todas las preguntas antes de finalizar (pendientes: ' + pendientes.join(', ') + ').', 4500);
+      return;
+    }
+
+    // Tras las 6: ofrecer siempre las 2 extras opcionales (quiz y práctica con Axioma IA).
+    if (quizConExtrasOpcionales_() && !estado.extrasDesbloqueadas) {
+      var nExtra = Number(estado.config.preguntasReserva) || 2;
+      var totalBase = estado.config.totalPreguntas || 6;
+      abrirModal(
+        '¿Quieres hacer ' + nExtra + ' preguntas extras?',
+        (pendientes.length
+          ? 'Atención: te falta responder ' + pendientes.length + ' de las ' + totalBase + ' preguntas (' + pendientes.join(', ') +
+            '); sin respuesta cuentan como incorrectas.\n\n'
+          : 'Ya respondiste las ' + totalBase + ' preguntas ' + (estado.practica ? 'de la práctica' : 'del quiz') + '.\n\n') +
+          'Puedes intentar ' + nExtra + ' extras opcionales: si aciertas, pueden reponer alguna que fallaste. ' +
+          'Si las fallas o las dejas en blanco, NO restan ' + (estado.practica ? 'puntaje' : 'a tu nota') + '.\n\n' +
+          'El tiempo sigue corriendo.',
+        'Sí, hacer las extras',
+        function () { desbloquearExtrasOpcionales_(); },
+        'No, entregar ahora',
+        function () { enviarQuiz(false); }
+      );
+      return;
+    }
+
+    var actividad = estado.practica ? 'la práctica' : 'el quiz';
+    var texto = pendientes.length
+      ? 'Atención: tienes ' + pendientes.length + ' pregunta(s) sin contestar: ' + pendientes.join(', ') +
+        '.\nLas preguntas sin respuesta se califican como incorrectas.\n\n¿Deseas finalizar de todos modos?'
+      : (estado.extrasDesbloqueadas
+        ? 'Puedes dejar extras sin responder (no restan). Una vez enviado, no podrás modificar tus respuestas.\n\n¿Deseas finalizar ' + actividad + '?'
+        : 'Respondiste todas las preguntas. Una vez enviado, no podrás modificar tus respuestas.\n\n¿Deseas finalizar ' + actividad + '?');
+    abrirModal('¿Finalizar ' + actividad + '?', texto, 'Sí, finalizar', function () { enviarQuiz(false); }, 'Seguir respondiendo');
+  }
+
+  function deshabilitarControles(deshabilitar) {
+    ['btn-anterior', 'btn-siguiente', 'btn-finalizar', 'btn-pista', 'btn-verificar'].forEach(function (id) {
+      $(id).disabled = deshabilitar;
+    });
+    var entradas = document.querySelectorAll('#pregunta-respuesta input, #pregunta-respuesta button, #tutor-mensaje, .nav-punto');
+    for (var i = 0; i < entradas.length; i++) entradas[i].disabled = deshabilitar;
+    if (!deshabilitar && estado.preguntas.length) {
+      actualizarNavegador();
+      actualizarVerificacion(estado.preguntas[estado.actual]);
+      actualizarContadorPistas();
+    }
+    renderizarProcedimiento();
+  }
+
+  /** Envía el quiz una sola vez (protección contra doble clic). */
+  function enviarQuiz(tiempoAgotado) {
+    if (estado.enviando || estado.finalizado) return;
+    cerrarPeriodoFuera();
+    estado.enviando = true;
+    actualizarBloqueoVentana();
+    clearTimeout(estado.temporizadorGuardado);
+    clearInterval(estado.latido);
+    deshabilitarControles(true);
+    mostrarCarga(estado.cierreIntegridad ? 'La actividad se cerró por salir de la pestaña o reducir la ventana. Enviando tus respuestas…'
+      : (tiempoAgotado ? 'El tiempo terminó. Enviando tus respuestas…' : 'Calificando tu actividad…'));
+
+    google.script.run
+      .withSuccessHandler(function (res) {
+        ocultarCarga();
+        if (res && res.ok) {
+          estado.finalizado = true;
+          clearInterval(estado.intervalo);
+          borrarRespaldoLocal(estado.intentoId);
+          $('indicador-conexion').classList.add('oculto');
+          mostrarResultados(res);
+        } else {
+          manejarErrorEnvio(res, tiempoAgotado);
+        }
+      })
+      .withFailureHandler(function () {
+        esperarConexionEnvio(tiempoAgotado);
+      })
+      .finalizarQuiz({
+        intentoId: estado.intentoId,
+        respuestas: estado.respuestas,
+        tiempoAgotado: !!tiempoAgotado,
+        integridad: estado.integridad,
+        confianza: estado.confianza,
+        tiempos: tiemposParaEnviar(),
+        cierreIntegridad: estado.cierreIntegridad || '',
+        dispositivo: idDispositivo()
+      });
+  }
+
+  /**
+   * Sin conexión al enviar: las respuestas quedan en el equipo y el envío se repite solo
+   * (cada pocos segundos y en cuanto vuelve el internet), sin límite de intentos.
+   */
+  function esperarConexionEnvio(tiempoAgotado) {
+    estado.envioPendiente = { tiempoAgotado: !!tiempoAgotado };
+    estado.enviando = true;
+    deshabilitarControles(true);
+    guardarRespaldoLocal();
+    $('indicador-conexion').classList.remove('oculto');
+    mostrarCarga('Sin conexión. Tu quiz se enviará automáticamente cuando vuelva el internet. No cierres esta página.');
+    clearTimeout(estado.temporizadorEnvio);
+    estado.temporizadorEnvio = setTimeout(reintentarEnvioPendiente, ESPERA_REINTENTO_ENVIO_MS);
+  }
+
+  function reintentarEnvioPendiente() {
+    var pendiente = estado.envioPendiente;
+    clearTimeout(estado.temporizadorEnvio);
+    if (!pendiente || estado.finalizado) return;
+    estado.envioPendiente = null;
+    estado.enviando = false;
+    enviarQuiz(pendiente.tiempoAgotado);
+  }
+
+  function manejarErrorEnvio(res, tiempoAgotado) {
+    estado.enviando = false;
+    if (res && res.otroDispositivo) {
+      bloquearPorOtroDispositivo();
+      return;
+    }
+    var mensaje = (res && res.mensaje) || 'No fue posible enviar el quiz.';
+
+    if (!res || !res.reintentar) {
+      // Error definitivo (sesión expirada, intento duplicado, etc.).
+      estado.finalizado = true;
+      clearInterval(estado.intervalo);
+      abrirModal('No se pudo registrar el intento', mensaje, 'Entendido', null, null);
+      return;
+    }
+
+    var bloqueoServidor = /ocupado|atendiendo|registrando otros intentos|varias solicitudes/i.test(mensaje);
+    if (bloqueoServidor && estado.reintentosEnvio < MAX_REINTENTOS_BLOQUEO) {
+      estado.reintentosEnvio++;
+      mostrarToast('El servidor está registrando otros intentos. Tus respuestas siguen guardadas; reintentando (' +
+        estado.reintentosEnvio + '/' + MAX_REINTENTOS_BLOQUEO + ')…', 3500);
+      setTimeout(function () { enviarQuiz(tiempoAgotado); }, 3500);
+      return;
+    }
+
+    // Envíos forzados (tiempo agotado o cierre por integridad): se reintentan sin devolver el control.
+    var forzado = tiempoAgotado || !!estado.cierreIntegridad;
+    if (forzado && estado.reintentosEnvio < MAX_REINTENTOS_AUTOMATICOS) {
+      estado.reintentosEnvio++;
+      mostrarToast(mensaje + ' Reintentando (' + estado.reintentosEnvio + '/' + MAX_REINTENTOS_AUTOMATICOS + ')…', 3000);
+      setTimeout(function () { enviarQuiz(tiempoAgotado); }, 3000);
+      return;
+    }
+
+    if (forzado) {
+      deshabilitarControles(true);
+      abrirModal('Error al enviar', mensaje + '\nTus respuestas siguen guardadas. Presiona “Reintentar”.',
+        'Reintentar', function () { enviarQuiz(tiempoAgotado); }, null);
+    } else {
+      deshabilitarControles(false);
+      iniciarLatido();
+      abrirModal('Error al enviar', mensaje + '\nTus respuestas siguen guardadas.',
+        'Reintentar', function () { enviarQuiz(false); }, 'Cerrar');
+    }
+  }
+
+  // =====================================================================
+  //  PANTALLA FINAL
+  // =====================================================================
+  function mostrarResultados(res) {
+    clearInterval(estado.latido);
+    salirPantallaCompleta();
+    $('temporizador').classList.add('oculto');
+    $('barra-tiempo').classList.add('oculto');
+    abrirTutorMovil(false);
+    $('bloqueo-ventana').classList.add('oculto');
+    $('final-nombre').textContent = 'Estudiante: ' + res.nombre;
+    document.querySelector('.tarjeta-final h1').textContent = res.practica ? 'Resultados de la práctica' : 'Resultados del quiz';
+    $('final-nota').nextElementSibling.textContent = res.practica ? 'Puntaje de práctica' : 'Nota sobre 100';
+    $('final-revision-nota').textContent = res.practica
+      ? 'Modo práctica: para cada pregunta verás la respuesta correcta y la solución paso a paso. Este intento no cuenta para la nota.'
+      : (estado.config && estado.config.mostrarSolucion
+        ? 'Revisa cada pregunta: se indica si tu respuesta fue correcta, por qué, y la solución paso a paso.'
+        : 'Revisa cada pregunta: se indica si tu respuesta fue correcta y qué conviene repasar. No se muestra la clave de respuestas.');
+
+    var estadoEl = $('final-estado');
+    estadoEl.textContent = 'Estado del intento: ' + res.estado +
+      (res.procedimientos && res.procedimientos.length ? ' · Procedimiento adjunto: ' + res.procedimientos.length + ' archivo(s)' : '');
+    if (res.cierreIntegridad) {
+      estadoEl.textContent += ' · Motivo: ' + res.cierreIntegridad + '. Tu docente fue notificado.';
+    }
+    estadoEl.className = 'estado-intento ' +
+      (res.estado === 'Finalizado' ? 'estado-finalizado' : res.estado === 'Incompleto' ? 'estado-incompleto' : 'estado-agotado');
+
+    var plan = $('final-plan');
+    plan.innerHTML = '';
+    (res.planEstudio || []).forEach(function (item) {
+      var li = crear('li');
+      li.appendChild(crear('strong', null, item.tema));
+      li.appendChild(crear('span', null, item.recomendacion));
+      plan.appendChild(li);
+    });
+    $('final-plan-seccion').classList.toggle('oculto', !(res.planEstudio && res.planEstudio.length));
+
+    $('final-aciertos').textContent = res.aciertos + ' / ' + res.totalPreguntas;
+    var notaMinima = estado.config && estado.config.notaAprobacion !== undefined ? Number(estado.config.notaAprobacion) : 70;
+    var aprobado = Number(res.nota) >= notaMinima;
+    pintarNotaCirculo(Number(res.nota) || 0, aprobado);
+    var veredicto = $('final-veredicto');
+    veredicto.textContent = aprobado ? 'Aprobado' : 'No aprobado';
+    veredicto.className = 'veredicto ' + (aprobado ? 'aprobado' : 'reprobado') + (res.practica ? ' oculto' : '');
+    pintarGraficoTemas(res.revision || []);
+    if (aprobado && !res.practica) setTimeout(lanzarConfeti, 400);
+    $('final-tiempo').textContent = res.tiempoLegible;
+    $('final-pistas').textContent = res.totalPistas;
+
+    var lista = $('final-temas');
+    lista.innerHTML = '';
+    if (res.temasReforzar && res.temasReforzar.length) {
+      res.temasReforzar.forEach(function (t) { lista.appendChild(crear('li', null, t)); });
+    } else {
+      lista.appendChild(crear('li', null, '¡Ninguno! Respondiste correctamente todas las preguntas.'));
+    }
+
+    $('final-mensaje').textContent = res.mensaje;
+    $('final-frase-texto').textContent = res.fraseMotivacion || '';
+    $('final-frase').classList.toggle('oculto', !res.fraseMotivacion);
+    pintarAvisoCorreo(res);
+    mostrarRevision(res.revision || []);
+    estado.intentoTerminado = res.intentoId;
+    prepararEncuesta(res.intentoId);
+    var fallados = (res.numerosFallados || []).length;
+    $('final-refuerzo').classList.toggle('oculto', !res.refuerzoDisponible);
+    $('final-refuerzo-texto').textContent = fallados + ' ejercicio' + (fallados === 1 ? '' : 's') +
+      ' del mismo tema que ' + (fallados === 1 ? 'la pregunta que fallaste' : 'las preguntas que fallaste') +
+      ', con otros números. Con solución paso a paso; no cuenta para la nota.';
+    $('btn-refuerzo').disabled = false;
+    if (res.refuerzo) document.querySelector('.tarjeta-final h1').textContent = 'Resultados de la práctica de refuerzo';
+    if (res.axioma) document.querySelector('.tarjeta-final h1').textContent = 'Resultados de la práctica con Axioma IA';
+    if (res.previa) {
+      document.querySelector('.tarjeta-final h1').textContent = 'Resultados de la práctica previa';
+      marcarPreviaHecha();
+    }
+    $('btn-final-accion').textContent = res.previa ? 'Volver al inicio para el quiz'
+      : (res.practica ? 'Practicar de nuevo' : (res.variosIntentos ? 'Volver al inicio' : 'Cerrar'));
+    $('btn-final-accion').disabled = false;
+    $('final-cierre').classList.add('oculto');
+    estado.variosIntentos = res.variosIntentos;
+    mostrarPantalla('pantalla-final');
+    if (res.tareasPendientes) completarEntrega(res, 0);
+  }
+
+  /**
+   * La nota ya está registrada; el servidor termina aparte la frase de Axioma IA y los correos
+   * (con PDF), que pueden tardar. Mientras tanto la pantalla avisa que el correo se está enviando.
+   */
+  function completarEntrega(res, intento) {
+    google.script.run
+      .withSuccessHandler(function (r) {
+        if (!r || !r.ok) {
+          if (intento < 2) setTimeout(function () { completarEntrega(res, intento + 1); }, 4000);
+          else pintarAvisoCorreo({ axioma: res.axioma, correo: res.correo, estadoCorreo: 'no_aplica' });
+          return;
+        }
+        if (r.enCurso && intento < 20) {
+          setTimeout(function () { completarEntrega(res, intento + 1); }, 5000);
+          return;
+        }
+        if (r.fraseMotivacion) {
+          $('final-frase-texto').textContent = r.fraseMotivacion;
+          $('final-frase').classList.remove('oculto');
+        }
+        pintarAvisoCorreo({ axioma: res.axioma, correo: r.correo || res.correo, comprobanteEnviado: r.comprobanteEnviado, estadoCorreo: r.estadoCorreo });
+      })
+      .withFailureHandler(function () {
+        if (intento < 2) setTimeout(function () { completarEntrega(res, intento + 1); }, 4000);
+      })
+      .completarFinalizacion(res.intentoId);
+  }
+
+  function pintarAvisoCorreo(res) {
+    var aviso = $('final-comprobante');
+    aviso.classList.remove('aviso-error');
+    if (res.estadoCorreo === 'pendiente' && res.correo) {
+      aviso.textContent = res.axioma
+        ? 'Enviando las preguntas de esta práctica con su solución a ' + res.correo + '…'
+        : 'Enviando tu comprobante a ' + res.correo + '… Tu nota ya quedó registrada.';
+      aviso.classList.remove('oculto');
+    } else if (res.axioma && res.comprobanteEnviado && res.correo) {
+      aviso.textContent = 'Te enviamos las preguntas de esta práctica con su solución paso a paso a ' + res.correo +
+        '. Si no lo ves en unos minutos, revisa la carpeta de Spam o Correo no deseado.';
+      aviso.classList.remove('oculto');
+    } else if (res.axioma && res.estadoCorreo === 'error') {
+      aviso.textContent = 'No fue posible enviar la práctica a tu correo esta vez (puede ser el límite de envíos por hora). Las soluciones están abajo.';
+      aviso.classList.add('aviso-error');
+      aviso.classList.remove('oculto');
+    } else if (res.comprobanteEnviado && res.correo) {
+      aviso.textContent = 'Se envió un comprobante con tu nota y la retroalimentación a ' + res.correo +
+        '. Si no lo ves en unos minutos, revisa la carpeta de Spam o Correo no deseado.';
+      aviso.classList.remove('oculto');
+    } else if (res.estadoCorreo === 'error') {
+      aviso.textContent = 'Tu intento quedó registrado, pero no fue posible enviar el comprobante a ' + res.correo +
+        '. Tu docente puede reenviarlo; no necesitas repetir el quiz.';
+      aviso.classList.add('aviso-error');
+      aviso.classList.remove('oculto');
+    } else {
+      aviso.classList.add('oculto');
+    }
+  }
+
+  function sinAnimaciones() {
+    return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  }
+
+  /** Círculo de la nota: el anillo y el número suben de 0 a la nota obtenida. */
+  function pintarNotaCirculo(nota, aprobado) {
+    var circulo = $('nota-circulo');
+    var valor = $('final-nota');
+    circulo.className = 'nota-circulo ' + (aprobado ? 'aprobado' : 'reprobado');
+    var destino = Math.max(0, Math.min(100, nota));
+    if (sinAnimaciones()) {
+      circulo.style.setProperty('--pct', destino);
+      valor.textContent = nota;
+      return;
+    }
+    var inicio = null;
+    var duracion = 1100;
+    function paso(t) {
+      if (inicio === null) inicio = t;
+      var avance = Math.min(1, (t - inicio) / duracion);
+      var suave = 1 - Math.pow(1 - avance, 3);
+      circulo.style.setProperty('--pct', destino * suave);
+      valor.textContent = avance < 1 ? Math.round(nota * suave) : nota;
+      if (avance < 1) requestAnimationFrame(paso);
+    }
+    requestAnimationFrame(paso);
+  }
+
+  /** Barras de aciertos por tema (una pregunta parcial cuenta como media). */
+  function pintarGraficoTemas(revision) {
+    var temas = {};
+    var orden = [];
+    revision.forEach(function (item) {
+      var tema = item.tema || 'Otros';
+      if (!temas[tema]) { temas[tema] = { total: 0, puntos: 0 }; orden.push(tema); }
+      temas[tema].total++;
+      temas[tema].puntos += item.estado === 'correcta' ? 1 : (item.estado === 'parcial' ? 0.5 : 0);
+    });
+    var grafico = $('final-temas-grafico');
+    grafico.innerHTML = '';
+    orden.forEach(function (tema) {
+      var t = temas[tema];
+      var pct = Math.round(t.puntos / t.total * 100);
+      var fila = crear('div', 'tema-fila');
+      fila.appendChild(crear('span', 'tema-nombre', tema));
+      var barra = crear('div', 'tema-barra');
+      var relleno = crear('div', 'tema-relleno ' + (pct >= 70 ? 'alto' : pct >= 40 ? 'medio' : 'bajo'));
+      barra.appendChild(relleno);
+      fila.appendChild(barra);
+      fila.appendChild(crear('span', 'tema-valor', (Math.round(t.puntos * 10) / 10) + '/' + t.total));
+      grafico.appendChild(fila);
+      setTimeout(function () { relleno.style.width = Math.max(pct, 3) + '%'; }, 60);
+    });
+    $('final-temas-grafico-seccion').classList.toggle('oculto', orden.length < 2);
+  }
+
+  function lanzarConfeti() {
+    if (sinAnimaciones()) return;
+    var colores = ['#00a9e0', '#00467f', '#15803d', '#f59e0b', '#e11d48', '#a855f7'];
+    var capa = crear('div', 'confeti');
+    for (var i = 0; i < 90; i++) {
+      var pieza = crear('i');
+      pieza.style.left = (Math.random() * 100) + '%';
+      pieza.style.background = colores[i % colores.length];
+      pieza.style.animationDelay = (Math.random() * 0.8) + 's';
+      pieza.style.animationDuration = (2.2 + Math.random() * 1.6) + 's';
+      pieza.style.transform = 'rotate(' + Math.round(Math.random() * 360) + 'deg)';
+      capa.appendChild(pieza);
+    }
+    document.body.appendChild(capa);
+    setTimeout(function () { if (capa.parentNode) capa.parentNode.removeChild(capa); }, 4800);
+  }
+
+  /** Retroalimentación por pregunta (sin clave de respuestas). */
+  function mostrarRevision(revision) {
+    var seccion = $('final-revision-seccion');
+    var lista = $('final-revision');
+    lista.innerHTML = '';
+    if (!revision.length) {
+      seccion.classList.add('oculto');
+      return;
+    }
+
+    var insignias = { correcta: 'Correcta', parcial: 'Parcial', incorrecta: 'Incorrecta', sin_respuesta: 'Sin responder' };
+    revision.forEach(function (item) {
+      var pregunta = preguntaPorNumero(item.numero) || {};
+      var tarjeta = crear('div', 'revision-item ' + item.estado);
+
+      var cabecera = crear('div', 'revision-cabecera');
+      cabecera.appendChild(crear('span', 'revision-titulo', 'Pregunta ' + (item.posicion || pregunta.posicion || item.numero) + ' · ' + item.tema));
+      cabecera.appendChild(crear('span', 'revision-insignia', insignias[item.estado] || ''));
+      tarjeta.appendChild(cabecera);
+      var cuerpo = crear('div', 'revision-cuerpo');
+      tarjeta.appendChild(cuerpo);
+
+      var textoEnunciado = item.enunciado || pregunta.enunciado;
+      if (textoEnunciado) {
+        var enunciado = crear('div', 'revision-enunciado');
+        escribirMat(enunciado, textoEnunciado);
+        cuerpo.appendChild(enunciado);
+      }
+      if (item.grafica) {
+        var figura = crear('figure', 'grafica');
+        dibujarGrafica(figura, item.grafica);
+        cuerpo.appendChild(figura);
+      }
+
+      var respuesta = crear('div', 'revision-respuesta');
+      respuesta.appendChild(crear('span', 'revision-etiqueta', 'Tu respuesta: '));
+      var contenido = crear('span');
+      if (!item.respuesta) {
+        contenido.textContent = 'No respondiste esta pregunta.';
+      } else if (item.tipo === 'numerica' || item.tipo === 'corta') {
+        escribirMat(contenido, aLatexEstudiante(item.respuesta));
+      } else {
+        escribirMat(contenido, fraccionesGrandes(item.respuesta));
+      }
+      respuesta.appendChild(contenido);
+      if (item.confianza) respuesta.appendChild(crear('span', 'texto-suave', ' (confianza: ' + item.confianza + ')'));
+      cuerpo.appendChild(respuesta);
+
+      if (item.comentarioError) {
+        var comentario = crear('p', 'revision-comentario');
+        comentario.appendChild(crear('span', 'revision-etiqueta', 'Sobre tu respuesta: '));
+        var textoComentario = crear('span');
+        escribirMat(textoComentario, item.comentarioError);
+        comentario.appendChild(textoComentario);
+        cuerpo.appendChild(comentario);
+      }
+
+      agregarSolucion(cuerpo, item);
+
+      lista.appendChild(tarjeta);
+    });
+    seccion.classList.remove('oculto');
+  }
+
+  function iniciarRefuerzo() {
+    if (!estado.intentoTerminado) return;
+    $('btn-refuerzo').disabled = true;
+    mostrarCarga('Preparando ejercicios de refuerzo…');
+    google.script.run
+      .withSuccessHandler(function (res) {
+        ocultarCarga();
+        if (!res || !res.ok) {
+          $('btn-refuerzo').disabled = false;
+          abrirModal('Práctica de refuerzo', (res && res.mensaje) || 'No fue posible preparar la práctica.', 'Entendido', null, null);
+          return;
+        }
+        comenzarQuiz(res);
+      })
+      .withFailureHandler(function () {
+        ocultarCarga();
+        $('btn-refuerzo').disabled = false;
+        mostrarToast('Error de conexión al preparar la práctica de refuerzo.', 4500);
+      })
+      .iniciarPracticaRefuerzo(estado.intentoTerminado);
+  }
+
+  // ---------- Encuesta final (anónima) ----------
+  function prepararEncuesta(intentoId) {
+    estado.encuestaNivel = 0;
+    var caja = $('final-encuesta');
+    caja.classList.remove('enviada');
+    caja.classList.toggle('oculto', !intentoId);
+    var botones = document.querySelectorAll('.encuesta-nivel');
+    for (var i = 0; i < botones.length; i++) {
+      botones[i].disabled = false;
+      botones[i].classList.remove('elegido');
+      botones[i].setAttribute('aria-checked', 'false');
+    }
+    $('encuesta-comentario').value = '';
+    $('encuesta-comentario').disabled = false;
+    $('btn-encuesta').disabled = true;
+    $('btn-encuesta').classList.remove('oculto');
+    $('encuesta-estado').textContent = '';
+  }
+
+  function elegirNivelEncuesta(e) {
+    var boton = e.target.closest('.encuesta-nivel');
+    if (!boton || boton.disabled) return;
+    estado.encuestaNivel = Number(boton.getAttribute('data-nivel'));
+    var botones = document.querySelectorAll('.encuesta-nivel');
+    for (var i = 0; i < botones.length; i++) {
+      var activo = botones[i] === boton;
+      botones[i].classList.toggle('elegido', activo);
+      botones[i].setAttribute('aria-checked', activo ? 'true' : 'false');
+    }
+    $('btn-encuesta').disabled = false;
+  }
+
+  function enviarEncuesta() {
+    if (!estado.intentoTerminado || !estado.encuestaNivel) return;
+    var boton = $('btn-encuesta');
+    boton.disabled = true;
+    $('encuesta-estado').textContent = 'Enviando…';
+    google.script.run
+      .withSuccessHandler(function (res) {
+        if (!res || !res.ok) {
+          boton.disabled = false;
+          $('encuesta-estado').textContent = (res && res.mensaje) || 'No fue posible enviar tu opinión.';
+          return;
+        }
+        var botones = document.querySelectorAll('.encuesta-nivel');
+        for (var i = 0; i < botones.length; i++) botones[i].disabled = true;
+        $('encuesta-comentario').disabled = true;
+        boton.classList.add('oculto');
+        $('final-encuesta').classList.add('enviada');
+        $('encuesta-estado').textContent = '¡Gracias! Tu opinión ayuda a mejorar el quiz.';
+      })
+      .withFailureHandler(function () {
+        boton.disabled = false;
+        $('encuesta-estado').textContent = 'Error de conexión. Intenta de nuevo.';
+      })
+      .guardarEncuesta(estado.intentoTerminado, estado.encuestaNivel, $('encuesta-comentario').value);
+  }
+
+  function accionFinal() {
+    if (estado.variosIntentos) {
+      // Reiniciar para un nuevo intento.
+      estado.intentoId = null;
+      estado.respuestas = {};
+      estado.chats = {};
+      estado.integridad = { salidas: 0, segundosFuera: 0 };
+      estado.verificadas = {};
+      estado.finalizado = false;
+      $('inicio-error').classList.add('oculto');
+      if (estado.previa) seleccionarModo('evaluado');
+      else if (estado.axioma) seleccionarModo('axioma');
+      else if (estado.practica) seleccionarModo('practica');
+      actualizarModoInicio();
+      mostrarPantalla('pantalla-inicio');
+    } else {
+      $('btn-final-accion').disabled = true;
+      var cierre = $('final-cierre');
+      cierre.textContent = 'Tu intento quedó registrado. Ya puedes cerrar esta pestaña.';
+      cierre.classList.remove('oculto');
+      try { window.top.close(); } catch (e) { /* el navegador puede impedir cerrar la pestaña */ }
+    }
+  }
+
+  // =====================================================================
+  //  PROCEDIMIENTO ESCRITO (fotos o PDF)
+  // =====================================================================
+  var MAX_BYTES_ARCHIVO = 5 * 1024 * 1024;
+  var LADO_MAXIMO_FOTO = 1600;
+
+  function renderizarProcedimiento() {
+    var proc = estado.procedimiento;
+    var caja = $('procedimiento');
+    caja.classList.toggle('oculto', !proc.habilitado);
+    if (!proc.habilitado) return;
+
+    $('proc-marca').textContent = proc.obligatorio ? 'Obligatorio' : 'Opcional';
+    $('proc-marca').className = 'etiqueta ' + (proc.obligatorio ? 'etiqueta-obligatoria' : 'etiqueta-tipo');
+    $('proc-instrucciones').textContent = 'Adjunta fotos claras o un PDF con tu desarrollo (máximo ' + proc.maxArchivos +
+      ' archivos de hasta 5 MB). Escribe tu nombre y carné en la hoja. Las fotos se reducen automáticamente.';
+
+    var bloqueado = estado.enviando || estado.finalizado;
+    var lista = $('proc-lista');
+    lista.innerHTML = '';
+    proc.archivos.forEach(function (nombre) {
+      var li = crear('li', 'proc-item');
+      li.appendChild(crear('span', 'proc-nombre', nombre));
+      var quitar = crear('button', 'btn-enlace', 'Quitar');
+      quitar.type = 'button';
+      quitar.disabled = bloqueado || estado.subiendo;
+      quitar.addEventListener('click', function () { quitarArchivo(nombre); });
+      li.appendChild(quitar);
+      lista.appendChild(li);
+    });
+
+    var lleno = proc.archivos.length >= proc.maxArchivos;
+    var inhabilitado = bloqueado || estado.subiendo || lleno;
+    $('proc-archivo').disabled = inhabilitado;
+    $('proc-boton').classList.toggle('deshabilitado', inhabilitado);
+    $('proc-estado').textContent = estado.subiendo ? 'Subiendo archivo…'
+      : (lleno ? 'Alcanzaste el máximo de archivos.' : (proc.archivos.length ? proc.archivos.length + ' archivo(s) adjunto(s).' : ''));
+  }
+
+  function alElegirArchivos(e) {
+    var archivos = Array.prototype.slice.call(e.target.files || []);
+    e.target.value = '';
+    var espacio = estado.procedimiento.maxArchivos - estado.procedimiento.archivos.length;
+    if (archivos.length > espacio) {
+      mostrarToast('Solo puedes adjuntar ' + espacio + ' archivo(s) más.', 4000);
+      archivos = archivos.slice(0, Math.max(0, espacio));
+    }
+    subirEnCadena(archivos, 0);
+  }
+
+  function subirEnCadena(archivos, i) {
+    if (i >= archivos.length || estado.finalizado || estado.enviando) {
+      estado.subiendo = false;
+      renderizarProcedimiento();
+      return;
+    }
+    estado.subiendo = true;
+    renderizarProcedimiento();
+    prepararArchivo(archivos[i], function (error, datos) {
+      if (error) {
+        mostrarToast(archivos[i].name + ': ' + error, 4500);
+        subirEnCadena(archivos, i + 1);
+        return;
+      }
+      google.script.run
+        .withSuccessHandler(function (res) {
+          if (res && res.ok) {
+            estado.procedimiento.archivos = res.archivos;
+          } else {
+            mostrarToast((res && res.mensaje) || 'No fue posible subir el archivo.', 4500);
+          }
+          subirEnCadena(archivos, i + 1);
+        })
+        .withFailureHandler(function () {
+          mostrarToast('Error de conexión al subir ' + archivos[i].name + '. Intenta de nuevo.', 4500);
+          subirEnCadena(archivos, i + 1);
+        })
+        .subirProcedimiento({ intentoId: estado.intentoId, tipo: datos.tipo, contenido: datos.contenido });
+    });
+  }
+
+  /** Convierte el archivo a base64; las fotos se reducen a JPEG para que la subida sea rápida. */
+  function prepararArchivo(archivo, listo) {
+    if (archivo.type === 'application/pdf') {
+      if (archivo.size > MAX_BYTES_ARCHIVO) return listo('el PDF supera 5 MB.');
+      var lector = new FileReader();
+      lector.onload = function () { listo(null, { tipo: 'application/pdf', contenido: lector.result }); };
+      lector.onerror = function () { listo('no se pudo leer el archivo.'); };
+      lector.readAsDataURL(archivo);
+      return;
+    }
+    if (!/^image\//.test(archivo.type)) return listo('formato no permitido (usa una foto o un PDF).');
+
+    var url = URL.createObjectURL(archivo);
+    var imagen = new Image();
+    imagen.onload = function () {
+      var escala = Math.min(1, LADO_MAXIMO_FOTO / Math.max(imagen.width, imagen.height));
+      var lienzo = document.createElement('canvas');
+      lienzo.width = Math.round(imagen.width * escala);
+      lienzo.height = Math.round(imagen.height * escala);
+      var ctx = lienzo.getContext('2d');
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, lienzo.width, lienzo.height);
+      ctx.drawImage(imagen, 0, 0, lienzo.width, lienzo.height);
+      URL.revokeObjectURL(url);
+      var datos = lienzo.toDataURL('image/jpeg', 0.8);
+      if (datos.length * 0.75 > MAX_BYTES_ARCHIVO) return listo('la foto es demasiado grande.');
+      listo(null, { tipo: 'image/jpeg', contenido: datos });
+    };
+    imagen.onerror = function () {
+      URL.revokeObjectURL(url);
+      listo('no se pudo abrir la imagen. Tómala de nuevo o envíala como JPG/PDF.');
+    };
+    imagen.src = url;
+  }
+
+  function quitarArchivo(nombre) {
+    if (estado.subiendo || estado.enviando || estado.finalizado) return;
+    estado.subiendo = true;
+    renderizarProcedimiento();
+    google.script.run
+      .withSuccessHandler(function (res) {
+        estado.subiendo = false;
+        if (res && res.ok) estado.procedimiento.archivos = res.archivos;
+        else mostrarToast((res && res.mensaje) || 'No fue posible quitar el archivo.', 4000);
+        renderizarProcedimiento();
+      })
+      .withFailureHandler(function () {
+        estado.subiendo = false;
+        mostrarToast('Error de conexión. Intenta de nuevo.', 4000);
+        renderizarProcedimiento();
+      })
+      .eliminarProcedimiento(estado.intentoId, nombre);
+  }
+
+  // =====================================================================
+  //  PANEL DEL DOCENTE (?vista=docente)
+  // =====================================================================
+  var docente = { pin: '', datos: null };
+
+  function iniciarPanelDocente() {
+    $('cab-curso').textContent = 'Panel del docente';
+    $('cab-titulo').textContent = '';
+    document.title = 'Panel del docente';
+    $('form-pin').addEventListener('submit', function (e) {
+      e.preventDefault();
+      cargarPanelDocente($('campo-pin').value.trim());
+    });
+    $('btn-doc-actualizar').addEventListener('click', function () { cargarPanelDocente(docente.pin); });
+    $('btn-doc-exportar').addEventListener('click', exportarDesdePanel);
+    $('doc-buscar').addEventListener('input', pintarTablaDocente);
+    $('doc-grupo').addEventListener('change', pintarTablaDocente);
+    $('btn-vivo-actualizar').addEventListener('click', cargarMonitoreo);
+    $('vivo-auto').addEventListener('change', programarMonitoreo);
+    $('btn-doc-proyector').addEventListener('click', abrirProyector);
+    $('btn-proy-salir').addEventListener('click', cerrarProyector);
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && docente.proyector) cerrarProyector();
+    });
+    document.addEventListener('fullscreenchange', function () {
+      if (docente.proyector && !document.fullscreenElement && docente.proyectorPantallaCompleta) cerrarProyector();
+    });
+    $('btn-doc-proyector-tab').addEventListener('click', function (e) {
+      if (!this.getAttribute('href')) {
+        e.preventDefault();
+        mostrarToast('Primero guarde la URL de la aplicación web: menú Quiz MA-321 → «Configurar URL de la aplicación web».', 6000);
+      }
+    });
+    mostrarPantalla('pantalla-docente');
+    var acceso = document.body.getAttribute('data-acceso');
+    if (acceso) {
+      $('docente-acceso').classList.add('oculto');
+      cargarPanelDocente(acceso);
+      return;
+    }
+    $('campo-pin').focus();
+  }
+
+  function cargarPanelDocente(pin) {
+    if (!pin) return;
+    $('pin-error').classList.add('oculto');
+    mostrarCarga('Cargando el panel…');
+    google.script.run
+      .withSuccessHandler(function (res) {
+        ocultarCarga();
+        if (!res || !res.ok) {
+          var mensaje = (res && res.mensaje) || 'No fue posible cargar el panel.';
+          if (docente.datos) {
+            mostrarToast(mensaje, 4500);
+          } else {
+            $('docente-acceso').classList.remove('oculto');
+            $('pin-error').textContent = mensaje;
+            $('pin-error').classList.remove('oculto');
+          }
+          return;
+        }
+        var primeraCarga = !docente.datos;
+        docente.pin = pin;
+        docente.datos = res;
+        $('campo-pin').value = '';
+        pintarPanelDocente(res);
+        if (primeraCarga) {
+          cargarMonitoreo();
+          programarMonitoreo();
+          if (document.body.getAttribute('data-proyector') === '1') abrirProyector();
+        }
+      })
+      .withFailureHandler(function () {
+        ocultarCarga();
+        if (!docente.datos) $('docente-acceso').classList.remove('oculto');
+        $('pin-error').textContent = 'Error de conexión. Intente de nuevo.';
+        $('pin-error').classList.remove('oculto');
+      })
+      .obtenerPanelDocente(pin);
+  }
+
+  function pintarPanelDocente(d) {
+    $('docente-acceso').classList.add('oculto');
+    $('docente-panel').classList.remove('oculto');
+    $('cab-titulo').textContent = d.curso;
+    $('doc-titulo').textContent = d.titulo;
+
+    $('doc-ventana').textContent = 'Modo práctica: ' + (d.practicaHabilitada ? 'habilitado' : 'deshabilitado');
+    if (/^https:\/\//.test(d.urlHoja || '')) $('doc-hoja').href = d.urlHoja;
+    if (/^https:\/\/script\.google\.com\//.test(d.urlProyector || '')) $('btn-doc-proyector-tab').href = d.urlProyector;
+    else $('btn-doc-proyector-tab').removeAttribute('href');
+
+    var r = d.resumen;
+    var metricas = [
+      [r.intentos, 'Intentos evaluados'], [r.promedio, 'Promedio'], [r.mediana, 'Mediana'],
+      [r.aprobacion + ' %', 'Aprobación (≥ ' + d.notaAprobacion + ')'],
+      [r.intentos ? r.maxima + ' / ' + r.minima : '—', 'Máxima / mínima'], [r.practicas, 'Intentos de práctica']
+    ];
+    var resumen = $('doc-resumen');
+    resumen.innerHTML = '';
+    metricas.forEach(function (m) {
+      var caja = crear('div', 'metrica');
+      caja.appendChild(crear('span', 'metrica-valor', String(m[0])));
+      caja.appendChild(crear('span', 'metrica-etiqueta', m[1]));
+      resumen.appendChild(caja);
+    });
+
+    pintarHistograma(d.intentos, d.notaAprobacion);
+    pintarAnalisisPreguntas(d.porPregunta);
+
+    var alertas = $('doc-alertas');
+    alertas.innerHTML = '';
+    if (!d.alertas.length) alertas.appendChild(crear('li', 'texto-suave', 'Sin alertas.'));
+    d.alertas.forEach(function (a) { alertas.appendChild(crear('li', 'doc-alerta ' + a.tipo, a.texto)); });
+
+    var selector = $('doc-grupo');
+    var elegido = selector.value;
+    selector.innerHTML = '';
+    selector.appendChild(crear('option', null, 'Todos los grupos')).value = '';
+    var grupos = [];
+    d.intentos.forEach(function (a) { if (a.grupo && grupos.indexOf(a.grupo) === -1) grupos.push(a.grupo); });
+    grupos.sort().forEach(function (g) { selector.appendChild(crear('option', null, g)).value = g; });
+    selector.value = grupos.indexOf(elegido) !== -1 ? elegido : '';
+
+    pintarTablaDocente();
+  }
+
+  /** Histograma de notas en tramos de 10 puntos; los tramos aprobados se pintan en verde. */
+  function pintarHistograma(intentos, notaAprobacion) {
+    var tramos = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    intentos.forEach(function (a) {
+      var k = Math.min(9, Math.max(0, Math.floor((Number(a.nota) || 0) / 10)));
+      tramos[k]++;
+    });
+    var maximo = Math.max.apply(null, tramos) || 1;
+    var caja = $('doc-histograma');
+    caja.innerHTML = '';
+    tramos.forEach(function (n, k) {
+      var columna = crear('div', 'histo-columna');
+      columna.title = (k * 10) + '–' + (k === 9 ? 100 : k * 10 + 9.99) + ': ' + n + ' estudiante(s)';
+      columna.appendChild(crear('span', 'histo-valor', n ? String(n) : ''));
+      var barra = crear('div', 'histo-barra ' + (k * 10 >= notaAprobacion ? 'aprobado' : 'reprobado'));
+      barra.style.height = (n / maximo * 100) + '%';
+      var zona = crear('div', 'histo-zona');
+      zona.appendChild(barra);
+      columna.appendChild(zona);
+      columna.appendChild(crear('span', 'histo-etiqueta', k === 9 ? '90–100' : (k * 10) + '–' + (k * 10 + 9)));
+      caja.appendChild(columna);
+    });
+    $('doc-histograma-nota').textContent = intentos.length
+      ? intentos.length + ' intento(s) evaluado(s). Verde: tramos con nota de aprobación (≥ ' + notaAprobacion + ').'
+      : 'Aún no hay intentos evaluados.';
+  }
+
+  /** Logro, dificultad, discriminación y error más frecuente de cada pregunta. */
+  function formatearDuracion(segundos) {
+    segundos = Math.round(Number(segundos) || 0);
+    var m = Math.floor(segundos / 60);
+    var s = segundos % 60;
+    return m ? m + ' min' + (s ? ' ' + s + ' s' : '') : s + ' s';
+  }
+
+  function pintarAnalisisPreguntas(porPregunta) {
+    var preguntas = $('doc-preguntas');
+    preguntas.innerHTML = '';
+    porPregunta.forEach(function (q) {
+      var fila = crear('div', 'doc-pregunta');
+      var titulo = crear('div', 'doc-pregunta-titulo');
+      titulo.appendChild(crear('span', null, 'P' + q.n + ' · ' + q.tema));
+      var insignias = crear('span', 'doc-insignias');
+      if (q.total) {
+        var nivel = q.porcentaje >= 85 ? ['Muy fácil', 'info'] : q.porcentaje >= 60 ? ['Media', 'ok']
+          : q.porcentaje >= 35 ? ['Difícil', 'medio'] : ['Muy difícil', 'bajo'];
+        insignias.appendChild(crear('span', 'doc-insignia ' + nivel[1], nivel[0]));
+      }
+      if (q.discriminacion !== null && q.discriminacion !== undefined) {
+        var dsc = q.discriminacion;
+        var calidad = dsc >= 0.3 ? ['ok', 'buena'] : dsc >= 0.2 ? ['medio', 'aceptable'] : ['bajo', 'revisar'];
+        insignias.appendChild(crear('span', 'doc-insignia ' + calidad[0],
+          'Discriminación ' + String(dsc.toFixed(2)).replace('.', ',') + ' · ' + calidad[1]));
+      }
+      titulo.appendChild(insignias);
+      fila.appendChild(titulo);
+
+      var barra = crear('div', 'doc-barra');
+      var relleno = crear('div', 'doc-barra-relleno' + (q.porcentaje < 50 ? ' bajo' : q.porcentaje < 70 ? ' medio' : ''));
+      relleno.style.width = q.porcentaje + '%';
+      barra.appendChild(relleno);
+      fila.appendChild(barra);
+      var detalle = q.total ? q.porcentaje + ' % de logro (' + q.total + ' respuestas)' : 'Sin datos';
+      if (q.versiones.length > 1) {
+        detalle += ' · ' + q.versiones.map(function (x) { return 'versión ' + x.codigo + ': ' + x.porcentaje + ' %'; }).join(' · ');
+      }
+      if (q.tiempoTipico) detalle += ' · Tiempo típico: ' + formatearDuracion(q.tiempoTipico);
+      fila.appendChild(crear('div', 'texto-suave', detalle));
+      if (q.errorFrecuente) {
+        var error = crear('div', 'doc-error-frecuente');
+        error.appendChild(crear('b', null, 'Error más frecuente (versión ' + q.errorFrecuente.version + ', ' + q.errorFrecuente.veces + ' estudiantes): '));
+        error.appendChild(document.createTextNode(q.errorFrecuente.texto));
+        fila.appendChild(error);
+      }
+      if (q.discriminacion !== null && q.discriminacion !== undefined && q.discriminacion < 0) {
+        fila.appendChild(crear('div', 'doc-error-frecuente alerta-texto',
+          'Los estudiantes con peor nota aciertan más esta pregunta que los de mejor nota: revise la clave o la redacción.'));
+      }
+      preguntas.appendChild(fila);
+    });
+  }
+
+  function pintarTablaDocente() {
+    if (!docente.datos) return;
+    var texto = $('doc-buscar').value.trim().toLowerCase();
+    var grupo = $('doc-grupo').value;
+    var filas = docente.datos.intentos.filter(function (a) {
+      if (grupo && a.grupo !== grupo) return false;
+      return !texto || a.nombre.toLowerCase().indexOf(texto) !== -1 || a.carne.toLowerCase().indexOf(texto) !== -1;
+    });
+    var cuerpo = $('doc-tabla');
+    cuerpo.innerHTML = '';
+    filas.forEach(function (a) {
+      var tr = crear('tr');
+      var celda = function (valor, clase) {
+        var td = crear('td', clase || null, String(valor));
+        tr.appendChild(td);
+        return td;
+      };
+      celda(a.fecha);
+      celda(a.nombre);
+      celda(a.carne);
+      celda(a.grupo);
+      celda(a.nota, a.nota >= docente.datos.notaAprobacion ? 'nota-aprobada' : 'nota-reprobada');
+      celda(a.aciertos);
+      celda(a.tiempo);
+      celda(a.pistas);
+      celda(a.salidas, a.salidas >= 3 ? 'celda-alerta' : null);
+      celda(a.estado);
+      var proc = celda('');
+      if (!a.procedimientos.length) proc.textContent = '—';
+      a.procedimientos.forEach(function (p, k) {
+        if (!/^https:\/\//.test(p.url)) return;
+        var enlace = crear('a', null, 'Archivo ' + (k + 1));
+        enlace.href = p.url;
+        enlace.target = '_blank';
+        enlace.rel = 'noopener';
+        proc.appendChild(enlace);
+        proc.appendChild(document.createTextNode(' '));
+      });
+      celda(a.comprobante || '—', /^Error/.test(a.comprobante) ? 'celda-alerta' : null);
+      celda('').appendChild(botonReabrir(a));
+      cuerpo.appendChild(tr);
+    });
+    $('doc-vacio').classList.toggle('oculto', filas.length > 0);
+  }
+
+  // ---------- Monitoreo en vivo ----------
+  function programarMonitoreo() {
+    clearInterval(docente.intervaloVivo);
+    if ($('vivo-auto').checked && docente.pin) docente.intervaloVivo = setInterval(cargarMonitoreo, 20000);
+  }
+
+  function cargarMonitoreo() {
+    if (!docente.pin || docente.cargandoVivo) return;
+    docente.cargandoVivo = true;
+    google.script.run
+      .withSuccessHandler(function (res) {
+        docente.cargandoVivo = false;
+        if (!res || !res.ok) {
+          $('vivo-resumen').textContent = (res && res.mensaje) || 'No fue posible cargar el monitoreo.';
+          return;
+        }
+        pintarMonitoreo(res);
+      })
+      .withFailureHandler(function () {
+        docente.cargandoVivo = false;
+        $('vivo-resumen').textContent = 'Sin conexión; se reintentará en la próxima actualización.';
+      })
+      .obtenerMonitoreo(docente.pin);
+  }
+
+  function textoSinSenal(seg) {
+    return seg < 120 ? 'hace ' + seg + ' s' : 'hace ' + Math.round(seg / 60) + ' min';
+  }
+
+  // ---------- Modo proyector (anónimo: sin nombres, carnés ni notas) ----------
+  function abrirProyector() {
+    if (!docente.pin) return;
+    docente.proyector = true;
+    var d = docente.datos || {};
+    $('proy-curso').textContent = d.curso || '';
+    $('proy-titulo').textContent = d.titulo || '';
+    var capa = $('proyector');
+    capa.classList.remove('oculto');
+    docente.proyectorPantallaCompleta = false;
+    try {
+      if (capa.requestFullscreen) {
+        capa.requestFullscreen().then(function () { docente.proyectorPantallaCompleta = true; }, function () {});
+      }
+    } catch (e) { /* sin pantalla completa: se ve igual en la ventana */ }
+    pintarProyector();
+    actualizarRelojProyector();
+    clearInterval(docente.relojProyector);
+    docente.relojProyector = setInterval(actualizarRelojProyector, 1000);
+    clearInterval(docente.intervaloProyector);
+    docente.intervaloProyector = setInterval(cargarMonitoreo, 20000);
+    cargarMonitoreo();
+  }
+
+  function cerrarProyector() {
+    if (!docente.proyector) return;
+    docente.proyector = false;
+    clearInterval(docente.relojProyector);
+    clearInterval(docente.intervaloProyector);
+    $('proyector').classList.add('oculto');
+    if (document.fullscreenElement && document.exitFullscreen) {
+      try { document.exitFullscreen(); } catch (e) { /* ya salió */ }
+    }
+  }
+
+  function actualizarRelojProyector() {
+    var ahora = new Date();
+    var dos = function (n) { return (n < 10 ? '0' : '') + n; };
+    $('proy-hora').textContent = dos(ahora.getHours()) + ':' + dos(ahora.getMinutes());
+    $('proy-cierre').parentNode.classList.add('oculto');
+  }
+
+  function pintarProyector() {
+    var res = docente.vivo;
+    if (!docente.proyector || !res) return;
+    var enCurso = res.intentos.filter(function (a) { return a.enCurso; });
+    $('proy-encurso').textContent = enCurso.length;
+    $('proy-terminados').textContent = res.intentos.length - enCurso.length;
+    var avance = enCurso.length
+      ? Math.round(enCurso.reduce(function (s, a) { return s + (a.total ? a.respondidas / a.total : 0); }, 0) / enCurso.length * 100)
+      : 0;
+    $('proy-avance').textContent = avance + ' %';
+    var total = res.intentos.length ? res.intentos[0].total : 0;
+    var conteo = [];
+    for (var i = 0; i < total; i++) conteo.push(0);
+    enCurso.forEach(function (a) { if (a.posicion >= 1 && a.posicion <= total) conteo[a.posicion - 1]++; });
+    var maximo = Math.max.apply(null, conteo.concat([1]));
+    var barras = $('proy-barras');
+    barras.innerHTML = '';
+    conteo.forEach(function (n, i) {
+      var col = crear('div', 'proyector-columna');
+      col.appendChild(crear('span', 'proyector-valor', n ? String(n) : ''));
+      var barra = crear('div', 'proyector-barra');
+      barra.style.height = (n ? Math.max(4, Math.round(n / maximo * 80)) : 0) + '%';
+      col.appendChild(barra);
+      col.appendChild(crear('span', 'proyector-etiqueta', 'P' + (i + 1)));
+      barras.appendChild(col);
+    });
+    barras.classList.toggle('oculto', !total);
+    $('proy-pie').textContent = (enCurso.length ? '' : 'Nadie está resolviendo el quiz en este momento. ') +
+      'Actualizado a las ' + res.hora + ' · se actualiza cada 20 s.' +
+      (document.fullscreenElement ? '' : ' · Pulse F11 para verlo en pantalla completa.');
+  }
+
+  function pintarMonitoreo(res) {
+    docente.vivo = res;
+    pintarProyector();
+    var enCurso = res.intentos.filter(function (a) { return a.enCurso; }).length;
+    $('vivo-resumen').textContent = enCurso + ' en curso · ' + (res.intentos.length - enCurso) +
+      ' terminado(s) recientemente · actualizado a las ' + res.hora;
+    var cuerpo = $('vivo-tabla');
+    cuerpo.innerHTML = '';
+    res.intentos.forEach(function (a) {
+      var tr = crear('tr', a.enCurso ? null : 'fila-terminada');
+      var celda = function (valor, clase) {
+        var td = crear('td', clase || null, String(valor));
+        tr.appendChild(td);
+        return td;
+      };
+      var conexion = celda('');
+      var punto = 'terminado';
+      var textoConexion = 'Terminado';
+      if (a.enCurso) {
+        punto = a.segundosSinSenal < 75 ? 'en-linea' : (a.segundosSinSenal < 180 ? 'inestable' : 'sin-senal');
+        textoConexion = a.segundosSinSenal < 75 ? 'En línea' : 'Sin señal ' + textoSinSenal(a.segundosSinSenal);
+      }
+      conexion.appendChild(crear('span', 'vivo-punto ' + punto));
+      conexion.appendChild(document.createTextNode(textoConexion));
+      celda(a.nombre);
+      celda(a.carne);
+      celda(a.grupo || '—');
+      celda(a.enCurso ? a.posicion + ' de ' + a.total : '—');
+      celda(a.respondidas + ' / ' + a.total);
+      celda(a.verificadas);
+      celda(a.enCurso ? formatearReloj(a.restantes) + (a.extraMin ? ' (+' + a.extraMin + ' min)' : '') : '—');
+      var avisos = celda(a.advertencias + (a.salidas ? ' · ' + a.salidas + ' salida(s)' : ''),
+        a.advertencias > 0 || a.otroDispositivo > 0 ? 'celda-alerta' : null);
+      if (a.otroDispositivo > 0) {
+        avisos.appendChild(crear('div', 'aviso-dispositivo',
+          'Intentó entrar desde otro dispositivo' + (a.otroDispositivo > 1 ? ' (' + a.otroDispositivo + ' veces)' : '')));
+      } else if (a.liberado && a.enCurso) {
+        avisos.appendChild(crear('div', 'texto-suave', 'Dispositivo liberado'));
+      }
+      celda(a.copiados, a.copiados > 0 ? 'celda-alerta' : null);
+      celda(a.estado + (!a.enCurso && a.nota !== undefined && a.nota !== null && a.nota !== '' ? ' · nota ' + a.nota : ''));
+      var acciones = celda('');
+      if (a.enCurso) {
+        [5, 10].forEach(function (min) {
+          var b = crear('button', 'btn btn-secundario btn-mini', '+' + min + ' min');
+          b.type = 'button';
+          b.addEventListener('click', function () { darTiempoExtra(a, min); });
+          acciones.appendChild(b);
+        });
+        if (a.otroDispositivo > 0) {
+          var liberar = crear('button', 'btn btn-secundario btn-mini', 'Liberar dispositivo');
+          liberar.type = 'button';
+          liberar.title = 'Permite que el estudiante continúe en el nuevo celular o computadora';
+          liberar.addEventListener('click', function () { liberarDispositivo(a); });
+          acciones.appendChild(liberar);
+        }
+      } else {
+        acciones.appendChild(botonReabrir(a));
+      }
+      cuerpo.appendChild(tr);
+    });
+    $('vivo-vacio').classList.toggle('oculto', res.intentos.length > 0);
+  }
+
+  function botonReabrir(a) {
+    var b = crear('button', 'btn btn-secundario btn-mini', 'Reabrir');
+    b.type = 'button';
+    b.title = 'Permite que el estudiante continúe este intento con sus respuestas';
+    b.addEventListener('click', function () { reabrirIntento(a); });
+    return b;
+  }
+
+  function reabrirIntento(a) {
+    abrirModal('Reabrir intento',
+      'Se reabrirá el intento de ' + a.nombre + ' (' + a.carne + ') con 10 minutos y sus advertencias en cero.\n\n' +
+      'Su nota actual se retira de los resultados (queda copia en la pestaña «Intentos reabiertos») y se registrará la nueva al enviar. ' +
+      'El estudiante debe volver a abrir el enlace del quiz con el mismo carné.\n\n' +
+      'Solo es posible durante las 6 horas siguientes al inicio del intento.',
+      'Reabrir con 10 min', function () {
+        mostrarCarga('Reabriendo el intento…');
+        google.script.run
+          .withSuccessHandler(function (res) {
+            ocultarCarga();
+            if (!res || !res.ok) {
+              abrirModal('No se pudo reabrir', (res && res.mensaje) || 'No fue posible reabrir el intento.', 'Entendido', null, null);
+              return;
+            }
+            abrirModal('Intento reabierto', res.mensaje, 'Entendido', null, null);
+            cargarMonitoreo();
+            cargarPanelDocente(docente.pin);
+          })
+          .withFailureHandler(function () {
+            ocultarCarga();
+            mostrarToast('Error de conexión al reabrir el intento.', 4000);
+          })
+          .reabrirIntentoPanel(docente.pin, a.id, 10);
+      }, 'Cancelar');
+  }
+
+  function liberarDispositivo(a) {
+    abrirModal('Liberar dispositivo',
+      a.nombre + ' (' + a.carne + ') intentó continuar su quiz desde otro celular o computadora.\n\n' +
+      'Si lo libera, podrá continuar en el nuevo dispositivo con sus respuestas guardadas y el dispositivo anterior quedará bloqueado. ' +
+      'Hágalo solo si el estudiante le explicó el motivo (por ejemplo, se le apagó el equipo).',
+      'Liberar', function () {
+        mostrarCarga('Liberando el dispositivo…');
+        google.script.run
+          .withSuccessHandler(function (res) {
+            ocultarCarga();
+            abrirModal(res && res.ok ? 'Dispositivo liberado' : 'No se pudo liberar',
+              (res && res.mensaje) || 'No fue posible liberar el dispositivo.', 'Entendido', null, null);
+            if (res && res.ok) cargarMonitoreo();
+          })
+          .withFailureHandler(function () {
+            ocultarCarga();
+            mostrarToast('Error de conexión al liberar el dispositivo.', 4000);
+          })
+          .liberarDispositivoPanel(docente.pin, a.id);
+      }, 'Cancelar');
+  }
+
+  function darTiempoExtra(a, minutos) {
+    abrirModal('Conceder tiempo adicional',
+      '¿Agregar ' + minutos + ' minutos al intento de ' + a.nombre + ' (' + a.carne + ')?\n\nSu reloj se actualizará en menos de 30 segundos.',
+      'Sí, agregar', function () {
+        mostrarCarga('Agregando tiempo…');
+        google.script.run
+          .withSuccessHandler(function (res) {
+            ocultarCarga();
+            mostrarToast((res && res.mensaje) || 'No fue posible agregar tiempo.', 5000);
+            if (res && res.ok) cargarMonitoreo();
+          })
+          .withFailureHandler(function () {
+            ocultarCarga();
+            mostrarToast('Error de conexión al agregar tiempo.', 4000);
+          })
+          .darTiempoExtraPanel(docente.pin, a.id, minutos);
+      }, 'Cancelar');
+  }
+
+  function exportarDesdePanel() {
+    var boton = $('btn-doc-exportar');
+    boton.disabled = true;
+    mostrarCarga('Generando la exportación…');
+    google.script.run
+      .withSuccessHandler(function (res) {
+        ocultarCarga();
+        boton.disabled = false;
+        var aviso = $('doc-exportacion');
+        aviso.innerHTML = '';
+        aviso.classList.remove('oculto', 'aviso-error');
+        if (!res || !res.ok) {
+          aviso.textContent = (res && res.mensaje) || 'No fue posible exportar.';
+          aviso.classList.add('aviso-error');
+          return;
+        }
+        aviso.appendChild(document.createTextNode('Se exportaron ' + res.filas + ' estudiantes (mejor intento de cada carné). '));
+        if (/^https:\/\//.test(res.url)) {
+          var enlace = crear('a', null, 'Abrir el archivo CSV en Drive');
+          enlace.href = res.url;
+          enlace.target = '_blank';
+          enlace.rel = 'noopener';
+          aviso.appendChild(enlace);
+        }
+        aviso.appendChild(document.createTextNode(' · También quedó en la pestaña “Exportación notas” de la hoja.'));
+      })
+      .withFailureHandler(function () {
+        ocultarCarga();
+        boton.disabled = false;
+        mostrarToast('Error de conexión al exportar.', 4000);
+      })
+      .exportarNotasPanel(docente.pin);
+  }
+
+  // ---------- Arranque ----------
+  inicializarApp();
+</script>

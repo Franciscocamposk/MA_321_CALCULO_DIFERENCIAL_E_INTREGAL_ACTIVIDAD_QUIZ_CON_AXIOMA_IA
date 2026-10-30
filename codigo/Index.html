@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <base target="_top">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Quiz de Cálculo</title>
+  <!-- KaTeX: tipografía matemática profesional (LaTeX). Si no carga, el quiz
+       muestra la notación en texto plano y sigue funcionando. -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" crossorigin="anonymous">
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js" crossorigin="anonymous"></script>
+  <!-- Estilos (archivo CSS.html) -->
+  <?!= include('CSS'); ?>
+</head>
+<body data-vista="<?= vista ?>" data-acceso="<?= acceso ?>" data-proyector="<?= proyector ?>">
+
+  <!-- ===================== BARRA SUPERIOR ===================== -->
+  <header class="barra-superior">
+    <div class="marca">
+      <?!= include('Logo'); ?>
+      <div>
+        <div id="cab-curso" class="cab-curso">Cargando…</div>
+        <div id="cab-titulo" class="cab-titulo"></div>
+      </div>
+    </div>
+    <div class="barra-derecha">
+      <button id="btn-letra" type="button" class="btn-tema btn-letra" title="Agrandar la letra" aria-label="Agrandar la letra"><span aria-hidden="true">A<small>A</small></span></button>
+      <button id="btn-contraste" type="button" class="btn-tema" title="Activar alto contraste" aria-label="Activar alto contraste" aria-pressed="false">
+        <svg class="icono" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 3v18a9 9 0 0 0 0-18z" fill="currentColor"/></svg>
+      </button>
+      <div id="temporizador" class="temporizador oculto" role="timer" aria-live="off">
+        <svg class="anillo" viewBox="0 0 44 44" aria-hidden="true">
+          <circle class="anillo-fondo" cx="22" cy="22" r="19"></circle>
+          <circle id="anillo-progreso" class="anillo-progreso" cx="22" cy="22" r="19"></circle>
+        </svg>
+        <div class="temporizador-textos">
+          <span class="temporizador-etiqueta">Tiempo restante</span>
+          <span id="tiempo-restante" class="temporizador-valor">--:--</span>
+        </div>
+      </div>
+    </div>
+    <div id="barra-tiempo" class="barra-tiempo oculto" aria-hidden="true"><div id="barra-tiempo-relleno"></div></div>
+  </header>
+
+  <main class="contenedor">
+
+    <!-- ===================== CARGA INICIAL ===================== -->
+    <section id="pantalla-carga" class="pantalla activa">
+      <div class="tarjeta centrado">
+        <div class="spinner"></div>
+        <p>Cargando el quiz…</p>
+      </div>
+    </section>
+
+    <!-- ===================== PANTALLA DE INICIO ===================== -->
+    <section id="pantalla-inicio" class="pantalla">
+      <div class="tarjeta tarjeta-inicio">
+        <div class="portada">
+          <div class="portada-logo"><?!= include('Logo'); ?></div>
+          <h1 id="inicio-titulo"></h1>
+          <p id="inicio-subtitulo" class="subtitulo"></p>
+        </div>
+        <div id="inicio-ventana" class="alerta oculto" role="status"></div>
+
+        <div class="resumen-inicio">
+          <div class="resumen-item">
+            <span class="resumen-icono"><svg class="icono" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg></span>
+            <span id="chip-preguntas"></span>
+          </div>
+          <div class="resumen-item">
+            <span class="resumen-icono"><svg class="icono" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="6"/><path d="M15.48 12.89 17 22l-5-3-5 3 1.52-9.11"/></svg></span>
+            <span id="chip-puntaje"></span>
+          </div>
+          <div class="resumen-item">
+            <span class="resumen-icono"><svg class="icono" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg></span>
+            <span id="chip-tiempo"></span>
+          </div>
+          <div class="resumen-item">
+            <span class="resumen-icono"><svg class="icono" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg></span>
+            <span id="chip-intentos"></span>
+          </div>
+        </div>
+
+        <h2 class="seccion-titulo">Instrucciones</h2>
+        <ul class="instrucciones">
+          <li><span class="instr-icono"><svg class="icono" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span><span id="instr-navegacion">Verás una pregunta a la vez; puedes avanzar y regresar con los botones “Anterior” y “Siguiente”.</span></li>
+          <li><span class="instr-icono"><svg class="icono" viewBox="0 0 24 24" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/></svg></span><span>Tus respuestas se guardan mientras navegas.</span></li>
+          <li id="instr-verificar" class="oculto"><span class="instr-icono"><svg class="icono" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg></span><span>Con “Verificar respuesta” sabrás al instante si tu respuesta es correcta y recibirás orientación. <strong>Una vez verificada, la respuesta queda fija</strong> y no podrás cambiarla.</span></li>
+          <li><span class="instr-icono"><svg class="icono" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg></span><span>El temporizador inicia al presionar “Iniciar quiz”. Si el tiempo termina, el quiz se envía automáticamente.</span></li>
+          <li><span class="instr-icono"><svg class="icono" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18h6M10 22h4"/><path d="M15.09 14c.18-.98.65-1.74 1.41-2.5A4.65 4.65 0 0 0 18 8 6 6 0 0 0 6 8c0 1 .23 2.23 1.5 3.5A4.61 4.61 0 0 1 8.91 14"/></svg></span><span id="instr-pistas"></span></li>
+          <li><span class="instr-icono"><svg class="icono" viewBox="0 0 24 24" aria-hidden="true"><path d="M16 3h5v5M4 20 21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></svg></span><span>Cada estudiante puede recibir datos distintos y las opciones en otro orden.</span></li>
+          <li><span class="instr-icono"><svg class="icono" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span><span id="instr-ventana">Salir de la pestaña del quiz queda registrado.</span></li>
+          <li><span class="instr-icono"><svg class="icono" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3v18h18"/><path d="M18 17V9M13 17V5M8 17v-3"/></svg></span><span id="instr-final"></span></li>
+        </ul>
+
+        <form id="form-inicio" novalidate>
+          <div id="selector-modo" class="selector-modo oculto" role="radiogroup" aria-label="Modo del quiz">
+            <label class="modo-opcion">
+              <input type="radio" name="modo" value="evaluado" checked>
+              <span><strong>Quiz evaluado</strong><small>6 preguntas. Al terminar puedes decidir si haces 2 extras opcionales (reponen fallos; si las fallas no restan). Cuenta para la nota.</small></span>
+            </label>
+            <label class="modo-opcion" id="modo-opcion-previa">
+              <input type="radio" name="modo" value="previa">
+              <span><strong>Práctica previa</strong><small id="modo-previa-texto">Calentamiento con ejercicios distintos a los del quiz. No cuenta para la nota ni gasta tu intento.</small></span>
+            </label>
+            <label class="modo-opcion" id="modo-opcion-practica">
+              <input type="radio" name="modo" value="practica">
+              <span><strong>Práctica</strong><small>No cuenta para la nota. Intentos ilimitados y soluciones paso a paso.</small></span>
+            </label>
+            <label class="modo-opcion" id="modo-opcion-axioma">
+              <input type="radio" name="modo" value="axioma">
+              <span><strong>Práctica con Axioma IA</strong><small id="modo-axioma-texto">8 preguntas (6 + 2 extras) con la misma temática del quiz, creadas por Axioma IA. Pistas, verificar, solución paso a paso e integridad. Al terminar te llegan a tu correo. No cuenta para la nota.</small></span>
+            </label>
+          </div>
+          <div class="campo">
+            <label for="campo-nombre">Nombre completo <span class="requerido">*</span></label>
+            <input id="campo-nombre" type="text" maxlength="100" autocomplete="name" placeholder="Ej.: María Fernanda Rojas Solís">
+            <small class="error-campo" id="error-nombre"></small>
+          </div>
+          <div class="campo">
+            <label for="campo-correo">Correo institucional <span id="correo-marca" class="requerido">*</span></label>
+            <input id="campo-correo" type="email" maxlength="100" autocomplete="email" placeholder="nombre.apellido@ucr.ac.cr">
+            <small class="error-campo" id="error-correo"></small>
+          </div>
+          <div class="fila-campos">
+            <div class="campo">
+              <label for="campo-carne">Carné <span class="requerido">*</span></label>
+              <input id="campo-carne" type="text" maxlength="20" autocomplete="off" placeholder="Ej.: 2026123456">
+              <small class="error-campo" id="error-carne"></small>
+            </div>
+            <div class="campo">
+              <label for="campo-grupo">Grupo <span id="grupo-marca" class="requerido">*</span></label>
+              <input id="campo-grupo" type="text" maxlength="30" autocomplete="off" placeholder="Ej.: G01">
+              <small class="error-campo" id="error-grupo"></small>
+            </div>
+          </div>
+
+          <div id="campo-codigo-grupo" class="campo oculto">
+            <label for="campo-codigo">Código de acceso <span class="requerido">*</span></label>
+            <input id="campo-codigo" type="text" maxlength="30" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="Lo indica tu docente en clase">
+            <small class="error-campo" id="error-codigo"></small>
+          </div>
+
+          <div class="aviso-integridad" role="note">
+            <strong>Integridad académica.</strong>
+            <b>Axioma IA</b> te orienta con preguntas y pistas, pero <u>no da soluciones</u>.
+            Responde con tu propio razonamiento y no compartas las preguntas.
+          </div>
+
+          <div id="inicio-error" class="alerta alerta-error oculto" role="alert"></div>
+
+          <button id="btn-iniciar" type="submit" class="btn btn-primario btn-grande">Iniciar quiz</button>
+        </form>
+      </div>
+    </section>
+
+    <!-- ===================== PANTALLA DEL QUIZ ===================== -->
+    <section id="pantalla-quiz" class="pantalla">
+      <div class="quiz-layout">
+
+        <div class="columna-pregunta">
+          <div id="banda-practica" class="banda-practica oculto">Modo práctica: no cuenta para la nota. Al verificar o finalizar verás la solución paso a paso.</div>
+          <div class="progreso-info">
+            <span id="progreso-texto" aria-live="polite">Pregunta 1 de 6</span>
+            <span class="progreso-derecha">
+              <span id="indicador-guardado" class="indicador-guardado" aria-live="polite"></span>
+              <span id="respondidas-texto" class="texto-suave">0 respondidas</span>
+            </span>
+          </div>
+          <div class="barra-progreso" aria-hidden="true"><div id="barra-progreso-relleno"></div></div>
+          <nav id="navegador-preguntas" class="navegador" aria-label="Ir a pregunta"></nav>
+          <div id="nav-leyenda" class="nav-leyenda" aria-hidden="true">
+            <span><i class="ley ley-actual"></i>Actual</span>
+            <span><i class="ley ley-respondida"></i>Respondida</span>
+            <span class="ley-verif"><i class="ley ley-correcta"></i>Correcta</span>
+            <span class="ley-verif"><i class="ley ley-parcial"></i>Parcial</span>
+            <span class="ley-verif"><i class="ley ley-incorrecta"></i>Incorrecta</span>
+            <span class="ley-secuencial"><i class="ley ley-bloqueada"></i>Bloqueada</span>
+          </div>
+
+          <article id="tarjeta-pregunta" class="tarjeta tarjeta-pregunta">
+            <div class="pregunta-cabecera">
+              <span id="pregunta-etiqueta" class="etiqueta"></span>
+              <span id="pregunta-puntos" class="etiqueta etiqueta-puntos oculto"></span>
+              <span id="pregunta-tema" class="etiqueta etiqueta-tema oculto"></span>
+              <span id="pregunta-tipo" class="etiqueta etiqueta-tipo"></span>
+              <button id="btn-leer" type="button" class="btn-leer oculto" title="Escuchar el enunciado" aria-label="Escuchar el enunciado en voz alta" aria-pressed="false">
+                <svg class="icono" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M16 8.5a4.5 4.5 0 0 1 0 7"/><path d="M18.5 6a8 8 0 0 1 0 12"/></svg>
+                <span class="btn-leer-texto">Escuchar</span>
+              </button>
+            </div>
+            <div id="pregunta-enunciado" class="enunciado"></div>
+            <figure id="pregunta-grafica" class="grafica oculto" aria-label="Gráfica de la pregunta"></figure>
+            <div id="pregunta-respuesta" class="zona-respuesta"></div>
+            <div class="verificacion">
+              <div id="confianza" class="confianza oculto" role="radiogroup" aria-label="Nivel de confianza">
+                <span class="confianza-etiqueta">¿Qué tan seguro estás de tu respuesta?</span>
+                <button type="button" class="confianza-opcion" data-valor="Seguro">Seguro</button>
+                <button type="button" class="confianza-opcion" data-valor="Dudoso">Dudoso</button>
+                <button type="button" class="confianza-opcion" data-valor="Adivinando">Adivinando</button>
+              </div>
+              <button id="btn-verificar" type="button" class="btn btn-verificar oculto">Verificar respuesta</button>
+              <div id="pregunta-retro" class="retro-inmediata oculto" aria-live="polite"></div>
+            </div>
+          </article>
+
+          <div class="navegacion">
+            <button id="btn-anterior" type="button" class="btn btn-secundario">← Anterior</button>
+            <button id="btn-siguiente" type="button" class="btn btn-primario">Siguiente →</button>
+          </div>
+          <p id="aviso-secuencial" class="aviso-secuencial oculto" role="status">Responde esta pregunta para continuar con la siguiente.</p>
+
+          <!-- ---------- Procedimiento escrito (fotos o PDF) ---------- -->
+          <section id="procedimiento" class="tarjeta tarjeta-procedimiento oculto" aria-label="Procedimiento escrito">
+            <div class="proc-cabecera">
+              <h3>Procedimiento escrito</h3>
+              <span id="proc-marca" class="etiqueta"></span>
+            </div>
+            <p id="proc-instrucciones" class="texto-suave"></p>
+            <label id="proc-boton" class="btn btn-secundario btn-archivo">
+              Adjuntar foto o PDF
+              <input id="proc-archivo" type="file" accept="image/*,application/pdf" multiple>
+            </label>
+            <ul id="proc-lista" class="proc-lista"></ul>
+            <p id="proc-estado" class="texto-suave" aria-live="polite"></p>
+          </section>
+
+          <button id="btn-finalizar" type="button" class="btn btn-finalizar">Finalizar quiz</button>
+        </div>
+
+        <!-- ---------- Axioma IA ---------- -->
+        <aside id="panel-tutor" class="tarjeta panel-tutor" aria-label="Axioma IA">
+          <div class="tutor-cabecera">
+            <div class="tutor-identidad">
+              <span class="tutor-avatar" aria-hidden="true">∫</span>
+              <div>
+                <h2>Axioma IA</h2>
+                <span class="tutor-subtitulo">Orientación paso a paso</span>
+              </div>
+            </div>
+            <div class="tutor-contador" title="Pistas usadas en esta pregunta">
+              <span id="tutor-puntos" class="tutor-puntos" aria-hidden="true"></span>
+              <strong id="tutor-contador">0/3</strong>
+            </div>
+            <button id="btn-tutor-cerrar" type="button" class="btn-tutor-cerrar" aria-label="Cerrar Axioma IA">×</button>
+          </div>
+          <p class="tutor-aviso">Te orienta con preguntas y pistas, nunca con la respuesta.</p>
+          <p id="tutor-penalizacion" class="tutor-penalizacion oculto"></p>
+
+          <div id="tutor-chat" class="tutor-chat" aria-live="polite"></div>
+
+          <label for="tutor-mensaje" class="tutor-label">Describe tu intento o duda (opcional)</label>
+          <textarea id="tutor-mensaje" maxlength="300" rows="3" placeholder="Ej.: Obtuve x³ − x² + x, pero no sé cómo seguir… (Enter para enviar)"></textarea>
+          <div class="tutor-pie">
+            <span id="tutor-caracteres" class="texto-suave">0/300 · Enter envía, Shift+Enter cambia de línea</span>
+            <button id="btn-pista" type="button" class="btn btn-tutor">Pedir una pista</button>
+          </div>
+        </aside>
+      </div>
+      <div id="tutor-fondo" class="tutor-fondo" aria-hidden="true"></div>
+      <button id="btn-tutor-flotante" type="button" class="btn-tutor-flotante" aria-controls="panel-tutor">
+        <span class="tutor-avatar" aria-hidden="true">∫</span> Pedir ayuda
+      </button>
+    </section>
+
+    <!-- ===================== PANTALLA FINAL ===================== -->
+    <section id="pantalla-final" class="pantalla">
+      <div class="tarjeta tarjeta-final">
+        <h1>Resultados del quiz</h1>
+        <p id="final-nombre" class="subtitulo"></p>
+        <div id="final-estado" class="estado-intento"></div>
+
+        <div class="nota-circulo-zona">
+          <div id="nota-circulo" class="nota-circulo">
+            <div class="nota-circulo-centro">
+              <span class="metrica-valor" id="final-nota">-</span>
+              <span class="metrica-etiqueta">Nota sobre 100</span>
+            </div>
+          </div>
+          <span id="final-veredicto" class="veredicto oculto"></span>
+        </div>
+
+        <div id="final-frase" class="frase-motivacion oculto">
+          <span class="frase-etiqueta">Un mensaje para ti</span>
+          <p id="final-frase-texto"></p>
+        </div>
+
+        <div class="resultados-grid resultados-grid-3">
+          <div class="metrica"><span class="metrica-valor" id="final-aciertos">-</span><span class="metrica-etiqueta">Aciertos</span></div>
+          <div class="metrica"><span class="metrica-valor" id="final-tiempo">-</span><span class="metrica-etiqueta">Tiempo empleado</span></div>
+          <div class="metrica"><span class="metrica-valor" id="final-pistas">-</span><span class="metrica-etiqueta">Pistas solicitadas</span></div>
+        </div>
+
+        <section id="final-temas-grafico-seccion" class="oculto">
+          <h2 class="seccion-titulo">Aciertos por tema</h2>
+          <div id="final-temas-grafico" class="grafico-temas"></div>
+        </section>
+
+        <h2 class="seccion-titulo">Temas recomendados para repasar</h2>
+        <ul id="final-temas" class="lista-temas"></ul>
+
+        <section id="final-plan-seccion" class="oculto">
+          <h2 class="seccion-titulo">Tu plan de estudio personalizado</h2>
+          <ol id="final-plan" class="plan-estudio"></ol>
+        </section>
+
+        <div id="final-mensaje" class="mensaje-motivador"></div>
+        <p id="final-comprobante" class="aviso-comprobante oculto"></p>
+
+        <section id="final-revision-seccion" class="oculto">
+          <h2 class="seccion-titulo">Retroalimentación por pregunta</h2>
+          <p id="final-revision-nota" class="texto-suave"></p>
+          <div id="final-revision" class="revision-lista"></div>
+        </section>
+
+        <div id="final-refuerzo" class="refuerzo-caja oculto">
+          <span class="refuerzo-icono"><svg class="icono" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg></span>
+          <div class="refuerzo-texto">
+            <strong>Practica lo que fallaste</strong>
+            <span id="final-refuerzo-texto"></span>
+          </div>
+          <button id="btn-refuerzo" type="button" class="btn btn-primario">Practicar ejercicios parecidos</button>
+        </div>
+
+        <section id="final-encuesta" class="encuesta-caja oculto" aria-labelledby="encuesta-titulo">
+          <h2 id="encuesta-titulo" class="seccion-titulo">¿Qué tan difícil te pareció?</h2>
+          <p class="texto-suave">Encuesta anónima de un clic: no se guarda tu nombre, carné ni correo.</p>
+          <div id="encuesta-niveles" class="encuesta-niveles" role="radiogroup" aria-label="Dificultad del quiz">
+            <button type="button" class="encuesta-nivel" data-nivel="1" role="radio" aria-checked="false"><strong>1</strong><span>Muy fácil</span></button>
+            <button type="button" class="encuesta-nivel" data-nivel="2" role="radio" aria-checked="false"><strong>2</strong><span>Fácil</span></button>
+            <button type="button" class="encuesta-nivel" data-nivel="3" role="radio" aria-checked="false"><strong>3</strong><span>Adecuado</span></button>
+            <button type="button" class="encuesta-nivel" data-nivel="4" role="radio" aria-checked="false"><strong>4</strong><span>Difícil</span></button>
+            <button type="button" class="encuesta-nivel" data-nivel="5" role="radio" aria-checked="false"><strong>5</strong><span>Muy difícil</span></button>
+          </div>
+          <label for="encuesta-comentario" class="encuesta-etiqueta">Comentario opcional</label>
+          <textarea id="encuesta-comentario" class="encuesta-comentario" rows="2" maxlength="500" placeholder="¿Algo que mejorarías del quiz?"></textarea>
+          <div class="encuesta-acciones">
+            <button id="btn-encuesta" type="button" class="btn btn-secundario" disabled>Enviar opinión</button>
+            <span id="encuesta-estado" class="texto-suave" aria-live="polite"></span>
+          </div>
+        </section>
+
+        <button id="btn-final-accion" type="button" class="btn btn-primario btn-grande"></button>
+        <p id="final-cierre" class="texto-suave centrado-texto oculto"></p>
+      </div>
+    </section>
+
+    <!-- ===================== PANEL DEL DOCENTE (?vista=docente) ===================== -->
+    <section id="pantalla-docente" class="pantalla">
+      <div id="docente-acceso" class="tarjeta tarjeta-acceso">
+        <h1>Panel del docente</h1>
+        <p class="subtitulo">Ingrese el PIN de 4 caracteres configurado desde la hoja de cálculo (menú Quiz MA-321).</p>
+        <form id="form-pin" novalidate>
+          <div class="campo">
+            <label for="campo-pin">PIN</label>
+            <input id="campo-pin" type="password" maxlength="4" autocomplete="current-password">
+          </div>
+          <div id="pin-error" class="alerta alerta-error oculto" role="alert"></div>
+          <button id="btn-pin" type="submit" class="btn btn-primario btn-grande">Entrar</button>
+        </form>
+      </div>
+
+      <div id="docente-panel" class="oculto">
+        <div class="tarjeta docente-cabecera">
+          <div>
+            <h1 id="doc-titulo"></h1>
+            <p id="doc-ventana" class="subtitulo"></p>
+          </div>
+          <div class="docente-acciones">
+            <button id="btn-doc-actualizar" type="button" class="btn btn-secundario">Actualizar</button>
+            <button id="btn-doc-proyector" type="button" class="btn btn-secundario" title="Vista grande y anónima para proyectar en el aula">Modo proyector</button>
+            <a id="btn-doc-proyector-tab" class="btn btn-secundario" target="_blank" rel="noopener" title="Abre el modo proyector en una pestaña aparte, lista para pantalla completa">Proyector en pestaña completa</a>
+            <button id="btn-doc-exportar" type="button" class="btn btn-primario">Exportar notas (CSV)</button>
+            <a id="doc-hoja" class="btn btn-secundario" target="_blank" rel="noopener">Abrir hoja de cálculo</a>
+          </div>
+        </div>
+        <p id="doc-exportacion" class="aviso-comprobante oculto"></p>
+
+        <div id="doc-resumen" class="resultados-grid docente-resumen"></div>
+
+        <section class="tarjeta">
+          <div class="doc-filtros">
+            <h2 class="seccion-titulo">Monitoreo en vivo</h2>
+            <span id="vivo-resumen" class="texto-suave"></span>
+            <label class="vivo-auto"><input id="vivo-auto" type="checkbox" checked> Actualizar cada 20 s</label>
+            <button id="btn-vivo-actualizar" type="button" class="btn btn-secundario">Actualizar ahora</button>
+          </div>
+          <div class="tabla-contenedor">
+            <table class="tabla-docente">
+              <thead>
+                <tr>
+                  <th>Conexión</th><th>Estudiante</th><th>Carné</th><th>Grupo</th><th>Pregunta</th><th>Respondidas</th>
+                  <th>Verificadas</th><th>Tiempo restante</th><th>Advertencias</th><th>Copiar/pegar</th><th>Estado</th><th>Acciones</th>
+                </tr>
+              </thead>
+              <tbody id="vivo-tabla"></tbody>
+            </table>
+          </div>
+          <p id="vivo-vacio" class="texto-suave oculto">No hay estudiantes realizando el quiz en este momento.</p>
+        </section>
+
+        <section class="tarjeta doc-analisis">
+          <h2 class="seccion-titulo">Distribución de notas</h2>
+          <div id="doc-histograma" class="histograma" role="img" aria-label="Histograma de notas"></div>
+          <p id="doc-histograma-nota" class="texto-suave"></p>
+        </section>
+
+        <div class="docente-columnas">
+          <section class="tarjeta">
+            <h2 class="seccion-titulo">Análisis de preguntas</h2>
+            <p class="texto-suave doc-analisis-ayuda">
+              <b>Logro</b>: porcentaje de puntos obtenidos. <b>Discriminación</b>: cuánto mejor responden los estudiantes con mejor nota
+              que los de peor nota (≥ 0,30 buena · 0,20–0,29 aceptable · &lt; 0,20 revisar la pregunta). Se calcula con 6 intentos o más.
+            </p>
+            <div id="doc-preguntas" class="doc-preguntas"></div>
+          </section>
+          <section class="tarjeta">
+            <h2 class="seccion-titulo">Alertas</h2>
+            <ul id="doc-alertas" class="doc-alertas"></ul>
+          </section>
+        </div>
+
+        <section class="tarjeta">
+          <div class="doc-filtros">
+            <h2 class="seccion-titulo">Intentos</h2>
+            <input id="doc-buscar" type="search" placeholder="Buscar por nombre o carné">
+            <select id="doc-grupo"><option value="">Todos los grupos</option></select>
+          </div>
+          <div class="tabla-contenedor">
+            <table class="tabla-docente">
+              <thead>
+                <tr>
+                  <th>Fecha</th><th>Estudiante</th><th>Carné</th><th>Grupo</th><th>Nota</th><th>Aciertos</th>
+                  <th>Tiempo</th><th>Pistas</th><th>Salidas</th><th>Estado</th><th>Procedimiento</th><th>Comprobante</th><th>Acciones</th>
+                </tr>
+              </thead>
+              <tbody id="doc-tabla"></tbody>
+            </table>
+          </div>
+          <p id="doc-vacio" class="texto-suave oculto">No hay intentos que coincidan.</p>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <!-- ===================== OVERLAY DE CARGA ===================== -->
+  <!-- Bloqueo mientras la ventana del quiz esté reducida -->
+  <div id="bloqueo-ventana" class="overlay bloqueo-ventana oculto" role="alertdialog" aria-modal="true" aria-labelledby="bloqueo-titulo">
+    <div class="overlay-caja bloqueo-caja">
+      <div class="bloqueo-icono"><svg class="icono" viewBox="0 0 24 24" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3z"/><path d="M12 9v4M12 17h.01"/></svg></div>
+      <h3 id="bloqueo-titulo">La ventana del quiz está reducida</h3>
+      <p id="bloqueo-texto">Para continuar, la ventana debe volver a su tamaño completo. El quiz está bloqueado y el tiempo sigue corriendo.</p>
+      <p class="texto-suave">Maximízala con doble clic en la barra de título del navegador o con la tecla <b>Windows + ↑</b> (en Mac, el botón verde).</p>
+      <button id="btn-restaurar-ventana" type="button" class="btn btn-primario">Restaurar pantalla completa</button>
+    </div>
+  </div>
+
+  <div id="overlay-carga" class="overlay oculto" role="status" aria-live="assertive">
+    <div class="overlay-caja">
+      <div class="spinner"></div>
+      <p id="overlay-texto">Procesando…</p>
+    </div>
+  </div>
+
+  <!-- ===================== MODAL DE CONFIRMACIÓN ===================== -->
+  <div id="modal" class="overlay oculto" role="dialog" aria-modal="true" aria-labelledby="modal-titulo">
+    <div class="modal">
+      <h3 id="modal-titulo"></h3>
+      <p id="modal-texto"></p>
+      <div class="modal-acciones">
+        <button id="modal-cancelar" type="button" class="btn btn-secundario">Cancelar</button>
+        <button id="modal-aceptar" type="button" class="btn btn-primario">Aceptar</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== AVISOS BREVES ===================== -->
+  <div id="toast" class="toast oculto" role="status"></div>
+  <div id="indicador-conexion" class="indicador-conexion oculto" role="status">Sin conexión: tus respuestas se guardan en este dispositivo y se enviarán cuando vuelva el internet.</div>
+
+  <!-- Modo proyector del panel docente: sin nombres ni notas -->
+  <div id="proyector" class="proyector oculto" role="dialog" aria-label="Modo proyector">
+    <div class="proyector-cabecera">
+      <div>
+        <p id="proy-curso" class="proyector-curso"></p>
+        <h1 id="proy-titulo" class="proyector-titulo"></h1>
+      </div>
+      <div class="proyector-reloj">
+        <span id="proy-hora"></span>
+        <button id="btn-proy-salir" type="button" class="btn btn-secundario" title="Salir (Esc)">Salir</button>
+      </div>
+    </div>
+    <div class="proyector-cierre">
+      <span id="proy-cierre-etiqueta">Tiempo para el cierre</span>
+      <strong id="proy-cierre">—</strong>
+    </div>
+    <div class="proyector-tarjetas">
+      <div class="proyector-tarjeta"><strong id="proy-encurso">0</strong><span>Resolviendo ahora</span></div>
+      <div class="proyector-tarjeta"><strong id="proy-terminados">0</strong><span>Entregados (últimos 30 min)</span></div>
+      <div class="proyector-tarjeta"><strong id="proy-avance">0 %</strong><span>Avance promedio</span></div>
+    </div>
+    <h2 class="proyector-subtitulo">¿En qué pregunta va el grupo?</h2>
+    <div id="proy-barras" class="proyector-barras"></div>
+    <p id="proy-pie" class="proyector-pie"></p>
+  </div>
+
+  <!-- Lógica del cliente (archivo JavaScript.html) -->
+  <?!= include('JavaScript'); ?>
+</body>
+</html>
